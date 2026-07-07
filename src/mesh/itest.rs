@@ -106,6 +106,11 @@ fn mesh_end_to_end() {
         paused: Arc::new(AtomicBool::new(false)),
         concurrent: Arc::new(AtomicU32::new(0)),
         used_vram_milli: Arc::new(AtomicU32::new(0)),
+        abuse: Arc::new(super::abuse::AbuseControl::new({
+            let mut a = test_policy().abuse;
+            a.strike_limit = 3; // ban after 3 refusals, for the strike test below
+            a
+        })),
         quota: Arc::new(Mutex::new(HashMap::new())),
         org_root: Some(Arc::new(OrgRoot::from_seed([1u8; 32]))),
         used_nonces: Arc::new(Mutex::new(HashSet::new())),
@@ -174,7 +179,26 @@ fn mesh_end_to_end() {
     let (server_ok, client_ok) = stored.verify();
     assert!(server_ok && client_ok, "stored receipt is dual-signed and valid");
 
-    // ── 4. Revocation takes effect without restarting the daemon ─────────────
+    // ── 4. Repeat refusals earn a temporary ban (abuse control) ──────────────
+    {
+        let (mut ch, _p) =
+            transport::connect_member(&addr, &client, client_cert.clone(), &org_pub, &no_revs).expect("member connect");
+        let over_ctx = serde_json::json!([{ "role": "user", "content": "x" }]);
+        let mut last = String::new();
+        for _ in 0..4 {
+            // ctx above max_ctx is refused; after 3 strikes the node is banned.
+            ch.send_json(&Request::Chat { model: "qwen3:0.6b".into(), ctx: 999_999, messages: over_ctx.clone() })
+                .unwrap();
+            match ch.recv_json::<Frame>().expect("frame") {
+                Frame::Refused { reason } => last = reason,
+                other => panic!("expected refusal, got {other:?}"),
+            }
+        }
+        assert!(last.contains("banned"), "repeated refusals must earn a ban, got: {last}");
+        drop(ch);
+    }
+
+    // ── 5. Revocation takes effect without restarting the daemon ─────────────
     let mut list = RevocationList::load();
     list.add(org.revoke(client.public_bytes()), &org_pub).unwrap();
     list.save().unwrap();

@@ -13,6 +13,49 @@ pub struct Policy {
     pub serve: ServePolicy,
     pub quota: QuotaPolicy,
     pub availability: AvailabilityPolicy,
+    pub abuse: AbusePolicy,
+}
+
+/// Flood / DoS controls, applied to *every* connection (members included).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AbusePolicy {
+    /// Global cap on simultaneous connections.
+    pub max_connections: u32,
+    /// Simultaneous connections allowed from a single IP.
+    pub max_connections_per_ip: u32,
+    /// New-connection (handshake) rate per IP, averaged per minute.
+    pub handshake_rate_per_min: u32,
+    /// Burst allowance for the per-IP handshake bucket.
+    pub handshake_burst: u32,
+    /// Admission refusals from one node within `strike_window_s` before a ban.
+    pub strike_limit: u32,
+    pub strike_window_s: u64,
+    /// How long a banned node is refused, seconds.
+    pub ban_secs: u64,
+    /// Ceiling on tokens served to all peers combined, per hour.
+    pub global_tokens_per_hour: u64,
+    /// Node ids (base64) always refused.
+    pub deny_nodes: Vec<String>,
+    /// If non-empty, only these node ids may be served (allowlist).
+    pub only_nodes: Vec<String>,
+}
+
+impl Default for AbusePolicy {
+    fn default() -> Self {
+        Self {
+            max_connections: 256,
+            max_connections_per_ip: 16,
+            handshake_rate_per_min: 60,
+            handshake_burst: 20,
+            strike_limit: 10,
+            strike_window_s: 60,
+            ban_secs: 300,
+            global_tokens_per_hour: 2_000_000,
+            deny_nodes: vec![],
+            only_nodes: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,6 +91,7 @@ impl Default for Policy {
             serve: ServePolicy::default(),
             quota: QuotaPolicy::default(),
             availability: AvailabilityPolicy::default(),
+            abuse: AbusePolicy::default(),
         }
     }
 }

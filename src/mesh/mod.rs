@@ -9,6 +9,7 @@
 //!   client     peer ranking + remote run
 //!   gossip     best-effort node cards (advisory only)
 
+pub mod abuse;
 pub mod client;
 pub mod gossip;
 pub mod identity;

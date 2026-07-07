@@ -62,7 +62,37 @@ require_ac_power = true
 yield_to_local = true
 # Seconds of local inactivity before remote work is allowed again.
 local_cooldown_s = 60
+
+[abuse]
+# Flood / DoS controls, applied to EVERY connection — members included.
+# The by-IP checks run before the Noise handshake, so a flood is dropped in
+# microseconds without spawning a thread or doing crypto.
+max_connections          = 256    # global simultaneous connections
+max_connections_per_ip   = 16
+handshake_rate_per_min   = 60     # new connections per IP, averaged
+handshake_burst          = 20     # short-term burst allowance per IP
+# A node whose requests are refused this many times within the window is
+# temporarily banned (a self-inflicted cooldown for probing the limits).
+strike_limit   = 10
+strike_window_s = 60
+ban_secs        = 300
+# Ceiling on tokens served to all peers combined, per hour.
+global_tokens_per_hour = 2_000_000
+# Hard control by node id (base64), beyond revocation:
+deny_nodes = []       # always refused
+only_nodes = []       # if non-empty, ONLY these nodes may be served
 ```
+
+### Abuse-control layers
+
+1. **By IP, pre-handshake:** a per-IP token bucket rate-limits new connections,
+   and global + per-IP caps bound concurrency. Rejected here in microseconds.
+2. **By node id, post-auth:** `deny_nodes` / `only_nodes` and active bans.
+3. **Per request:** ban check, the global tokens/hour ceiling, and a strike on
+   each admission refusal (which can escalate to a temporary ban).
+
+The rate limit applies to members too — a stolen or compromised member key is
+exactly the source that would flood you.
 
 ### Admission order
 

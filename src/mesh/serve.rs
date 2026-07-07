@@ -19,6 +19,7 @@ use crate::ollama_api;
 use crate::policy::{evaluate, Admit, AdmissionRequest, AdmissionState, Policy};
 use crate::usage::{self, now_unix, UsageRecord};
 
+use super::abuse::AbuseControl;
 use super::gossip::{self, NodeCard};
 use super::identity::{MembershipCert, MeshIdentity, NodeKey, OrgRoot, RevocationList};
 use super::proto::{CoSign, EnrollResponse, Frame, Receipt, Request};
@@ -41,6 +42,7 @@ pub struct ServeCtx {
     pub paused: Arc<AtomicBool>,
     pub concurrent: Arc<AtomicU32>,
     pub used_vram_milli: Arc<AtomicU32>,
+    pub abuse: Arc<AbuseControl>,
     pub quota: Arc<Mutex<HashMap<String, Vec<(u64, u64)>>>>,
     /// Admin only: lets this node enroll new members.
     pub org_root: Option<Arc<OrgRoot>>,
@@ -77,8 +79,24 @@ pub fn run(ctx: ServeCtx, listen: &str) -> Result<(), String> {
 pub fn serve_loop(ctx: ServeCtx, listener: TcpListener) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+
+        // Pre-handshake flood gate, by IP — the cheapest possible rejection.
+        // A rate-limited or over-cap connection is dropped here, before any
+        // crypto or a thread is committed.
+        let ip = match stream.peer_addr() {
+            Ok(a) => a.ip(),
+            Err(_) => continue,
+        };
+        let permit = match ctx.abuse.allow_connection(ip, now_unix()) {
+            Ok(p) => p,
+            Err(_) => continue, // drop the stream silently
+        };
+
         let ctx = ctx.clone();
-        std::thread::spawn(move || handle(ctx, stream));
+        std::thread::spawn(move || {
+            let _permit = permit; // released when the connection ends
+            handle(ctx, stream);
+        });
     }
 }
 
@@ -95,6 +113,13 @@ fn handle(ctx: ServeCtx, stream: TcpStream) {
             return;
         }
     };
+
+    // Post-auth node checks: deny/allow lists and active bans (by node id).
+    let is_member = matches!(peer, Peer::Member { .. });
+    if let Err(reason) = ctx.abuse.check_node(peer.node_pub(), is_member, now_unix()) {
+        let _ = ch.send_json(&Frame::Refused { reason });
+        return;
+    }
 
     match peer {
         Peer::Member { node_pub, cert } => serve_member(&ctx, &mut ch, &node_pub, &cert.org_pub),
@@ -151,6 +176,19 @@ fn serve_chat(
         }
     }
 
+    // ── Abuse gate: active ban (may have been applied mid-connection) and the
+    //    global tokens/hour ceiling across all peers. ──────────────────────────
+    if let Some(retry) = ctx.abuse.banned_for(peer_pub, now_unix()) {
+        return ch
+            .send_json(&Frame::Refused { reason: format!("temporarily banned; retry in {retry}s") })
+            .map_err(|e| e.to_string());
+    }
+    if ctx.abuse.global_over_budget(now_unix()) {
+        return ch
+            .send_json(&Frame::Refused { reason: "server hourly capacity reached".into() })
+            .map_err(|e| e.to_string());
+    }
+
     // ── H1: admission ────────────────────────────────────────────────────────
     let projected = vram_fraction(&ctx.hw, model, cctx);
     let state = AdmissionState {
@@ -165,7 +203,12 @@ fn serve_chat(
     let req = AdmissionRequest { model: model.to_string(), ctx: cctx, projected_vram_fraction: projected };
 
     match evaluate(&ctx.policy, &req, &state) {
-        Admit::Refuse(reason) => return ch.send_json(&Frame::Refused { reason }).map_err(|e| e.to_string()),
+        Admit::Refuse(reason) => {
+            // A refusal is a strike: enough of them in a window earns a cooldown,
+            // so a peer can't hammer the gate for free.
+            ctx.abuse.record_strike(peer_pub, now_unix());
+            return ch.send_json(&Frame::Refused { reason }).map_err(|e| e.to_string());
+        }
         Admit::Queue(reason) => return ch.send_json(&Frame::Queued { reason }).map_err(|e| e.to_string()),
         Admit::Ok => {}
     }
@@ -223,6 +266,7 @@ fn serve_chat(
 
     // Record what we served regardless of outcome (partial usage still counts).
     record_served(ctx, peer_pub, model, tokens_in, tokens_out, duration_ms);
+    ctx.abuse.record_tokens(tokens_out, now_unix());
 
     if let Some(reason) = abort {
         return ch.send_json(&Frame::Error { reason }).map_err(|e| e.to_string());
@@ -391,6 +435,7 @@ pub fn daemon(ollama_host: &str, hw: Arc<HardwareInfo>, activity: Activity, list
         .ok_or("not a mesh member; run `v2 mesh join <ticket>` or `v2 mesh init`")?;
     let org_pub = ident.org_pub_bytes()?;
     let policy = Policy::load()?;
+    let policy_abuse = policy.abuse.clone();
 
     let paused = Arc::new(AtomicBool::new(false));
     {
@@ -413,6 +458,7 @@ pub fn daemon(ollama_host: &str, hw: Arc<HardwareInfo>, activity: Activity, list
         paused,
         concurrent: Arc::new(AtomicU32::new(0)),
         used_vram_milli: Arc::new(AtomicU32::new(0)),
+        abuse: Arc::new(AbuseControl::new(policy_abuse)),
         quota: Arc::new(Mutex::new(HashMap::new())),
         org_root: OrgRoot::load().ok().map(Arc::new),
         used_nonces: Arc::new(Mutex::new(load_nonces())),

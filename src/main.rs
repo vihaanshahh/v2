@@ -415,16 +415,36 @@ fn doctor(host: &str, _hw: &hardware::HardwareInfo) {
     }
 
     match policy::Policy::load() {
-        Ok(p) => line(
-            Badge::Ok,
-            "policy",
-            format!(
-                "{} remote job · {:.0}% VRAM cap · yield_to_local={}",
-                p.serve.max_concurrent_remote,
-                p.serve.max_vram_fraction * 100.0,
-                p.availability.yield_to_local
-            ),
-        ),
+        Ok(p) => {
+            line(
+                Badge::Ok,
+                "policy",
+                format!(
+                    "{} remote job · {:.0}% VRAM cap · yield_to_local={}",
+                    p.serve.max_concurrent_remote,
+                    p.serve.max_vram_fraction * 100.0,
+                    p.availability.yield_to_local
+                ),
+            );
+            let a = &p.abuse;
+            let lists = if !a.deny_nodes.is_empty() || !a.only_nodes.is_empty() {
+                format!(" · {} deny / {} allow", a.deny_nodes.len(), a.only_nodes.len())
+            } else {
+                String::new()
+            };
+            line(
+                Badge::Ok,
+                "abuse",
+                format!(
+                    "{}/min per IP · {} conns ({}/IP) · ban after {} strikes{}",
+                    a.handshake_rate_per_min,
+                    a.max_connections,
+                    a.max_connections_per_ip,
+                    a.strike_limit,
+                    lists,
+                ),
+            );
+        }
         Err(e) => line(Badge::Bad, "policy", format!("{e} (serving will refuse to start)")),
     }
     println!();
