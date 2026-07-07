@@ -121,6 +121,9 @@ pub struct MeteringReader<R: Read> {
     kind: String,
     start: Instant,
     logged: bool,
+    /// When false, metering is parsed but not persisted (used by tests so they
+    /// never write to the real ~/.v2/usage).
+    persist: bool,
 }
 
 impl<R: Read> MeteringReader<R> {
@@ -134,6 +137,7 @@ impl<R: Read> MeteringReader<R> {
             kind: kind.to_string(),
             start: Instant::now(),
             logged: false,
+            persist: true,
         }
     }
 
@@ -166,6 +170,9 @@ impl<R: Read> MeteringReader<R> {
         self.logged = true;
         // Parse any trailing line without a newline.
         self.try_parse_line();
+        if !self.persist {
+            return;
+        }
         let Some(stats) = self.last_stats.clone() else { return };
         if stats.eval_count == 0 && stats.prompt_eval_count == 0 {
             return;
@@ -221,6 +228,7 @@ mod tests {
     #[test]
     fn meters_tokens_from_stream_and_passes_bytes_through() {
         let mut r = MeteringReader::new(STREAM, "qwen3:8b".into(), "local", "local");
+        r.persist = false; // never touch ~/.v2 from tests
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         // Bytes passed through unchanged (transparent proxy).
@@ -230,8 +238,6 @@ mod tests {
         assert_eq!(stats.prompt_eval_count, 11);
         assert_eq!(stats.eval_count, 42);
         assert!(stats.done);
-        // Suppress the on-drop usage append in tests (no ~/.v2 writes).
-        r.logged = true;
     }
 
     #[test]
@@ -247,9 +253,9 @@ mod tests {
             }
         }
         let mut r = MeteringReader::new(Drip(STREAM, 0), "m".into(), "local", "local");
+        r.persist = false;
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(r.last_stats.as_ref().unwrap().eval_count, 42);
-        r.logged = true;
     }
 }
