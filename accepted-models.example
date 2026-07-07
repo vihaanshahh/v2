@@ -1,0 +1,5 @@
+# one model/pattern per line; glob ok
+llama3.2
+qwen3:8b
+gemma3:4b
+mistral-nemo:12b

@@ -1,0 +1,34 @@
+[package]
+name = "v2"
+version = "0.1.0"
+edition = "2021"
+description = "Which LLMs can you run? v2 tells you."
+
+[[bin]]
+name = "v2"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+colored = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+
+# Daemon + mesh (feature "daemon", on by default). The plain `v2` scan builds
+# with --no-default-features and pulls none of these — see H6 in DESIGN.md.
+tiny_http = { version = "0.12", optional = true }
+snow = { version = "0.9", optional = true }
+ed25519-dalek = { version = "2", optional = true }
+getrandom = { version = "0.2", optional = true }
+toml = { version = "0.8", optional = true }
+base64 = { version = "0.22", optional = true }
+
+[features]
+default = ["daemon"]
+daemon = ["dep:tiny_http", "dep:snow", "dep:ed25519-dalek", "dep:getrandom", "dep:toml", "dep:base64"]
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = true
