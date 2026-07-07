@@ -68,7 +68,7 @@ pub fn detect() -> HardwareInfo {
         }
         Os::MacOs => {
             if gpus.is_empty() {
-                gpus.extend(detect_apple_macos());
+                gpus.extend(detect_macos());
             }
         }
         Os::Windows => {
@@ -77,6 +77,10 @@ pub fn detect() -> HardwareInfo {
             }
         }
     }
+
+    // Drop any adapter that reported a blank name (seen from flaky wmic/driver
+    // output) so it can't show up as a nameless zero-VRAM GPU.
+    gpus.retain(|g| !g.name.trim().is_empty());
 
     HardwareInfo {
         cpu_name: detect_cpu_name(&os),
@@ -169,43 +173,147 @@ fn detect_amd_linux() -> Vec<GpuInfo> {
 
 // ── Apple (macOS) ────────────────────────────────────────────────────────────
 
-fn detect_apple_macos() -> Vec<GpuInfo> {
-    // Get unified memory size from sysctl
-    let mem_out = Command::new("sysctl")
-        .arg("-n")
-        .arg("hw.memsize")
-        .output();
-
-    let ram_bytes: u64 = mem_out
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-
-    if ram_bytes == 0 {
-        return vec![];
+/// True on Apple Silicon (M-series), false on Intel Macs. Uses the runtime
+/// sysctl rather than the compiled ARCH, so an x86_64 binary under Rosetta on an
+/// M-series machine is still correctly identified as Apple Silicon.
+fn is_apple_silicon() -> bool {
+    if sysctl_string("hw.optional.arm64").as_deref() == Some("1") {
+        return true;
     }
+    sysctl_string("machdep.cpu.brand_string")
+        .map(|s| s.starts_with("Apple "))
+        .unwrap_or(false)
+}
 
-    // Get chip name from system_profiler
-    let sp_out = Command::new("sysctl")
-        .arg("-n")
-        .arg("machdep.cpu.brand_string")
-        .output();
-
-    let chip = sp_out
+fn sysctl_string(key: &str) -> Option<String> {
+    Command::new("sysctl")
+        .args(["-n", key])
+        .output()
         .ok()
+        .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "Apple Silicon".to_string());
+        .filter(|s| !s.is_empty())
+}
 
-    // Apple Silicon uses unified memory — all of RAM is usable for GPU
-    // but llama.cpp typically caps at ~75% for GPU layers
-    vec![GpuInfo {
-        name: chip,
-        vendor: Vendor::Apple,
-        vram_bytes: ram_bytes,
-        shared_memory: true,
-    }]
+fn detect_macos() -> Vec<GpuInfo> {
+    if is_apple_silicon() {
+        let ram_bytes: u64 = sysctl_string("hw.memsize").and_then(|s| s.parse().ok()).unwrap_or(0);
+        if ram_bytes == 0 {
+            return vec![];
+        }
+        let chip = sysctl_string("machdep.cpu.brand_string").unwrap_or_else(|| "Apple Silicon".into());
+        // Unified memory: all of RAM is usable for the GPU; the engine caps the
+        // GPU share at ~75% for layer offload.
+        return vec![GpuInfo {
+            name: chip,
+            vendor: Vendor::Apple,
+            vram_bytes: ram_bytes,
+            shared_memory: true,
+        }];
+    }
+
+    // Intel Mac: no unified memory. Ask system_profiler for the real GPU(s).
+    // A machine with only an Intel iGPU returns nothing usable here, so the
+    // engine correctly treats it as CPU-only.
+    let out = Command::new("system_profiler")
+        .args(["SPDisplaysDataType", "-detailLevel", "mini"])
+        .output();
+    let text = out
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    let mut gpus = parse_macos_gpus(&text);
+    // If a discrete GPU exists, that's what Ollama/Metal uses — drop integrated
+    // ones so the display and fit math don't over-count an unusable iGPU.
+    if gpus.iter().any(|g| !g.shared_memory) {
+        gpus.retain(|g| !g.shared_memory);
+    }
+    gpus
+}
+
+/// Parse `system_profiler SPDisplaysDataType` text into GPUs. Discrete cards
+/// (`VRAM (Total)`) are dedicated; integrated GPUs (`VRAM (Dynamic, Max)`) are
+/// shared. GPUs with no usable VRAM are dropped so the machine reads as CPU-only.
+fn parse_macos_gpus(text: &str) -> Vec<GpuInfo> {
+    let mut gpus = vec![];
+    let mut name: Option<String> = None;
+    let mut vram: u64 = 0;
+    let mut shared = false;
+    let mut vendor_hint = String::new();
+
+    let flush = |gpus: &mut Vec<GpuInfo>, name: &Option<String>, vram: u64, shared: bool, vendor_hint: &str| {
+        if let Some(n) = name {
+            if vram > 0 {
+                let hay = format!("{n} {vendor_hint}").to_lowercase();
+                let vendor = if hay.contains("nvidia") || hay.contains("geforce") {
+                    Vendor::Nvidia
+                } else if hay.contains("amd") || hay.contains("radeon") {
+                    Vendor::Amd
+                } else if hay.contains("intel") {
+                    Vendor::Intel
+                } else if hay.contains("apple") {
+                    Vendor::Apple
+                } else {
+                    Vendor::Unknown
+                };
+                gpus.push(GpuInfo { name: n.clone(), vendor, vram_bytes: vram, shared_memory: shared });
+            }
+        }
+    };
+
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(v) = t.strip_prefix("Chipset Model:") {
+            // New GPU block — flush the previous one.
+            flush(&mut gpus, &name, vram, shared, &vendor_hint);
+            name = Some(v.trim().to_string());
+            vram = 0;
+            shared = false;
+            vendor_hint.clear();
+        } else if let Some(v) = t.strip_prefix("VRAM (Total):") {
+            vram = parse_vram(v);
+            shared = false;
+        } else if let Some(v) = t.strip_prefix("VRAM (Dynamic, Max):") {
+            vram = parse_vram(v);
+            shared = true;
+        } else if let Some(v) = t.strip_prefix("Vendor:") {
+            vendor_hint = v.trim().to_string();
+        }
+    }
+    flush(&mut gpus, &name, vram, shared, &vendor_hint);
+    // Dedicated GPUs first, then largest VRAM — so display + bandwidth pick the
+    // real discrete card over an integrated one.
+    gpus.sort_by(|a, b| {
+        a.shared_memory
+            .cmp(&b.shared_memory)
+            .then(b.vram_bytes.cmp(&a.vram_bytes))
+    });
+    gpus
+}
+
+/// Parse a system_profiler VRAM value like "4 GB", "1536 MB", "1.5 GB".
+fn parse_vram(raw: &str) -> u64 {
+    let s = raw.trim();
+    let mut num = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+        } else if !num.is_empty() {
+            break;
+        }
+    }
+    let Ok(value) = num.parse::<f64>() else { return 0 };
+    let upper = s.to_uppercase();
+    let mult = if upper.contains("GB") {
+        1024.0 * 1024.0 * 1024.0
+    } else if upper.contains("MB") {
+        1024.0 * 1024.0
+    } else {
+        1.0
+    };
+    (value * mult) as u64
 }
 
 fn detect_apple_linux() -> Vec<GpuInfo> {
@@ -345,5 +453,77 @@ fn detect_cpu_name(os: &Os) -> String {
                     .map(|s| s.trim().to_string())
             })
             .unwrap_or_else(|| "Unknown".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Real output shape from a 2019 Intel MacBook Pro (i7-9750H).
+    const INTEL_MBP: &str = "Graphics/Displays:
+
+    Intel UHD Graphics 630:
+
+      Chipset Model: Intel UHD Graphics 630
+      Type: GPU
+      Bus: Built-In
+      VRAM (Dynamic, Max): 1536 MB
+      Vendor: Intel
+
+    AMD Radeon Pro 5300M:
+
+      Chipset Model: AMD Radeon Pro 5300M
+      Type: GPU
+      Bus: PCIe
+      VRAM (Total): 4 GB
+      Vendor: AMD (0x1002)
+";
+
+    #[test]
+    fn parses_intel_mac_discrete_and_igpu() {
+        let gpus = parse_macos_gpus(INTEL_MBP);
+        assert_eq!(gpus.len(), 2);
+        // Dedicated AMD card must sort first (drives display + bandwidth).
+        assert_eq!(gpus[0].vendor, Vendor::Amd);
+        assert!(!gpus[0].shared_memory);
+        assert_eq!(gpus[0].vram_bytes, 4 * 1024 * 1024 * 1024);
+        // Intel iGPU is shared and second.
+        assert_eq!(gpus[1].vendor, Vendor::Intel);
+        assert!(gpus[1].shared_memory);
+        assert_eq!(gpus[1].vram_bytes, 1536 * 1024 * 1024);
+    }
+
+    #[test]
+    fn igpu_only_mac_reports_shared_not_dedicated() {
+        let text = "    Intel Iris Plus Graphics:
+      Chipset Model: Intel Iris Plus Graphics
+      VRAM (Dynamic, Max): 1536 MB
+      Vendor: Intel
+";
+        let gpus = parse_macos_gpus(text);
+        assert_eq!(gpus.len(), 1);
+        assert!(gpus[0].shared_memory, "iGPU must be shared, never treated as VRAM");
+    }
+
+    #[test]
+    fn gpu_with_no_vram_is_dropped() {
+        let text = "      Chipset Model: Some Display Adapter
+      Vendor: Unknown
+";
+        assert!(parse_macos_gpus(text).is_empty());
+    }
+
+    #[test]
+    fn empty_input_is_empty() {
+        assert!(parse_macos_gpus("").is_empty());
+    }
+
+    #[test]
+    fn parse_vram_units() {
+        assert_eq!(parse_vram("4 GB"), 4 * 1024 * 1024 * 1024);
+        assert_eq!(parse_vram("1536 MB"), 1536 * 1024 * 1024);
+        assert_eq!(parse_vram("1.5 GB"), (1.5 * 1024.0 * 1024.0 * 1024.0) as u64);
+        assert_eq!(parse_vram("garbage"), 0);
     }
 }

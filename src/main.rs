@@ -214,7 +214,8 @@ fn run() -> Result<(), String> {
     match cli.command {
         None => {
             if cli.json {
-                display::print_hw_json(&hw);
+                // The scan JSON already embeds a "hardware" block, so emit only
+                // that — one valid JSON document, not two concatenated objects.
                 run_scan(&hw, &load_opts, cli.ctx, cli.verbose, cli.family.as_deref(), true)?;
             } else {
                 display::print_hardware(&hw, cli.ctx, &load_opts, accepted.as_ref());

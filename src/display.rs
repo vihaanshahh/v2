@@ -65,24 +65,6 @@ pub fn print_hardware(
     );
 }
 
-pub fn print_hw_json(hw: &HardwareInfo) {
-    let gpus: Vec<_> = hw.gpus.iter().map(|g| {
-        serde_json::json!({
-            "name": g.name,
-            "vendor": g.vendor.to_string(),
-            "vram_gb": format!("{:.1}", g.vram_bytes as f64 / GIB),
-            "shared": g.shared_memory,
-        })
-    }).collect();
-    let out = serde_json::json!({
-        "gpus": gpus,
-        "ram_gb": format!("{:.1}", hw.ram_bytes as f64 / GIB),
-        "cpu": hw.cpu_name,
-        "os": hw.os.to_string(),
-    });
-    println!("{}", serde_json::to_string_pretty(&out).unwrap());
-}
-
 pub fn print_model_list(models: &[Model]) {
     println!("{}  {} models", "v2".bold(), models.len());
     println!(
