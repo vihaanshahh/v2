@@ -13,7 +13,9 @@ clap = { version = "4", features = ["derive"] }
 colored = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ureq = { version = "2", features = ["json"] }
+# No TLS backend: v2 only speaks localhost HTTP (Ollama) and raw-TCP+Noise
+# (mesh), so we drop ureq's rustls/ring — smaller binary, trivial cross-compile.
+ureq = { version = "2", features = ["json"], default-features = false }
 
 # Daemon + mesh (feature "daemon", on by default). The plain `v2` scan builds
 # with --no-default-features and pulls none of these — see H6 in DESIGN.md.
