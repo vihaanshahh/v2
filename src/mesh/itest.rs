@@ -21,11 +21,66 @@ use super::proto::{CoSign, EnrollResponse, Frame, Request};
 use super::serve::{self, ServeCtx};
 use super::transport;
 
+// These tests each point the process-global HOME at a temp dir, so they must not
+// run concurrently. This lock serialises them.
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn set_temp_home() {
     let dir = std::env::temp_dir().join(format!("v2-itest-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::env::set_var("HOME", &dir);
+}
+
+/// A mock Ollama that streams tokens *slowly* (a delay per read), so a test can
+/// reclaim the job mid-generation.
+fn mock_ollama_slow() -> String {
+    struct SlowReader {
+        lines: Vec<Vec<u8>>,
+        i: usize,
+        buf: Vec<u8>,
+    }
+    impl std::io::Read for SlowReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.buf.is_empty() {
+                if self.i >= self.lines.len() {
+                    return Ok(0);
+                }
+                std::thread::sleep(Duration::from_millis(120));
+                self.buf = self.lines[self.i].clone();
+                self.i += 1;
+            }
+            let n = self.buf.len().min(out.len());
+            out[..n].copy_from_slice(&self.buf[..n]);
+            self.buf.drain(..n);
+            Ok(n)
+        }
+    }
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let addr = server.server_addr().to_ip().unwrap();
+    let url = format!("http://{addr}");
+    std::thread::spawn(move || {
+        for req in server.incoming_requests() {
+            if req.url().contains("/api/tags") {
+                let _ = req.respond(tiny_http::Response::from_string(r#"{"models":[]}"#));
+                continue;
+            }
+            let mut lines: Vec<Vec<u8>> = (0..8)
+                .map(|i| format!("{{\"message\":{{\"content\":\" t{i}\"}},\"done\":false}}\n").into_bytes())
+                .collect();
+            lines.push(
+                br#"{"message":{"content":""},"done":true,"prompt_eval_count":5,"eval_count":8,"total_duration":1}"#
+                    .to_vec(),
+            );
+            let reader = SlowReader { lines, i: 0, buf: Vec::new() };
+            let resp = tiny_http::Response::new(tiny_http::StatusCode(200), vec![], reader, None, None);
+            let _ = req.respond(resp);
+        }
+    });
+    url
 }
 
 /// A mock Ollama that streams a fixed chat reply. Returns its base URL.
@@ -83,6 +138,7 @@ fn test_hw() -> HardwareInfo {
 
 #[test]
 fn mesh_end_to_end() {
+    let _g = lock();
     set_temp_home();
 
     // Org + an admin node (admin can both enroll members and serve inference).
@@ -204,4 +260,78 @@ fn mesh_end_to_end() {
     list.save().unwrap();
     let rejected = transport::connect_member(&addr, &client, client_cert, &org_pub, &no_revs);
     assert!(rejected.is_err(), "revoked node must be rejected on its next connection");
+}
+
+/// Owner reclaim terminates an in-flight generation mid-stream (deadman / H3):
+/// the client gets some tokens, then a preemption error — not a completion.
+#[test]
+fn preemption_terminates_inflight() {
+    let _g = lock();
+    set_temp_home();
+
+    let org = OrgRoot::from_seed([4u8; 32]);
+    let org_pub = org.public_bytes();
+    let server_node = NodeKey::from_seed([5u8; 32]);
+    let server_cert = org.issue_cert(server_node.public_bytes(), 0, vec![]);
+    let client = NodeKey::from_seed([6u8; 32]);
+    let client_cert = org.issue_cert(client.public_bytes(), 0, vec![]);
+
+    let ollama = mock_ollama_slow();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+
+    let paused = Arc::new(AtomicBool::new(false));
+    let ctx = ServeCtx {
+        node: Arc::new(server_node),
+        org_pub,
+        cert: server_cert,
+        policy: test_policy(),
+        ollama_host: ollama,
+        hw: Arc::new(test_hw()),
+        activity: Activity::new(),
+        paused: paused.clone(),
+        concurrent: Arc::new(AtomicU32::new(0)),
+        used_vram_milli: Arc::new(AtomicU32::new(0)),
+        abuse: Arc::new(super::abuse::AbuseControl::new(test_policy().abuse)),
+        quota: Arc::new(Mutex::new(HashMap::new())),
+        org_root: None,
+        used_nonces: Arc::new(Mutex::new(HashSet::new())),
+    };
+    std::thread::spawn(move || serve::serve_loop(ctx, listener));
+
+    let no_revs = RevocationList::default();
+    let (mut ch, _p) =
+        transport::connect_member(&addr, &client, client_cert, &org_pub, &no_revs).expect("member connect");
+    ch.send_json(&Request::Chat {
+        model: "qwen3:0.6b".into(),
+        ctx: 2048,
+        messages: serde_json::json!([{ "role": "user", "content": "hi" }]),
+    })
+    .unwrap();
+
+    // The owner reclaims the machine partway through the (slow) generation.
+    let p = paused.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        p.store(true, Ordering::SeqCst);
+    });
+
+    let mut tokens = 0;
+    let mut preempted = false;
+    loop {
+        match ch.recv_json::<Frame>() {
+            Ok(Frame::Accepted) => {}
+            Ok(Frame::Token { .. }) => tokens += 1,
+            Ok(Frame::Error { reason }) => {
+                assert!(reason.contains("preempted"), "expected a preemption, got: {reason}");
+                preempted = true;
+                break;
+            }
+            Ok(Frame::Done { .. }) => panic!("job completed but the owner reclaimed mid-stream"),
+            Ok(other) => panic!("unexpected frame: {other:?}"),
+            Err(e) => panic!("connection died before the preemption frame: {e}"),
+        }
+    }
+    assert!(preempted, "in-flight job must be terminated by owner reclaim");
+    assert!(tokens < 9, "should be cut off before all 9 tokens, got {tokens}");
 }

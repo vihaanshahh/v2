@@ -148,6 +148,20 @@ The full architecture, invariants, and failure harnesses are in
 
 ---
 
+## See it work
+
+`demo/two-node.sh` acts out two laptops on one machine (two isolated `~/.v2`
+homes, one shared Ollama) and walks the whole lifecycle — enrol, **accept** and
+stream a job, then terminate it three ways (**pause**, **resume**, **revoke**) —
+and prints the signed receipts at the end. Needs Ollama running.
+
+```bash
+bash demo/two-node.sh
+```
+
+The same lifecycle is covered by automated tests in `src/mesh/itest.rs`,
+including a job terminated **mid-generation** by owner reclaim.
+
 ## Documentation
 
 - **[docs/GUIDE.md](docs/GUIDE.md)** — getting started: scan, manage, meter.
