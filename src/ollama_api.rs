@@ -101,7 +101,13 @@ pub fn chat_stream<F: FnMut(&str) -> bool>(
     mut on_token: F,
 ) -> Result<(String, GenStats), String> {
     let url = format!("{}/api/chat", host.trim_end_matches('/'));
-    let resp = ureq::post(&url)
+    // Bound a stalled upstream: if Ollama goes silent between reads for this
+    // long, the read errors out instead of hanging the serving thread forever.
+    let agent = ureq::AgentBuilder::new()
+        .timeout_read(std::time::Duration::from_secs(60))
+        .build();
+    let resp = agent
+        .post(&url)
         .send_json(ureq::json!({ "model": model, "messages": messages, "stream": true }))
         .map_err(|e| format!("chat failed: {e}"))?;
 

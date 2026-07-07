@@ -85,6 +85,24 @@ impl Receipt {
         m.extend_from_slice(&self.ts.to_be_bytes());
         m
     }
+
+    /// Verify both signatures over the canonical bytes. Returns
+    /// `(server_sig_ok, client_sig_present_and_ok)`. Forging either requires the
+    /// corresponding node's secret key, so a tampered receipt fails to verify.
+    pub fn verify(&self) -> (bool, bool) {
+        let msg = self.signing_bytes();
+        let server_ok = sig_ok(&self.server_pub, &self.server_sig, &msg);
+        let client_ok = !self.client_sig.is_empty() && sig_ok(&self.client_pub, &self.client_sig, &msg);
+        (server_ok, client_ok)
+    }
+}
+
+fn sig_ok(pub_b64: &str, sig_b64: &str, msg: &[u8]) -> bool {
+    let (Ok(pk), Ok(sig)) = (super::unb64_arr::<32>(pub_b64), super::unb64_arr::<64>(sig_b64)) else {
+        return false;
+    };
+    let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&pk) else { return false };
+    vk.verify_strict(msg, &ed25519_dalek::Signature::from_bytes(&sig)).is_ok()
 }
 
 /// The client's co-signature, sent back after `Done`.

@@ -197,6 +197,76 @@ fn collect_cards() -> Result<Vec<(String, NodeCard)>, String> {
     Ok(out)
 }
 
+/// Read every stored receipt, verify both signatures, and reconcile totals.
+pub fn receipts() -> Result<(), String> {
+    let me = NodeKey::load_or_create()?.public_b64();
+    let dir = crate::paths::subdir("mesh/receipts").map_err(|e| e.to_string())?;
+    let mut entries: Vec<Receipt> = vec![];
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            if let Ok(raw) = std::fs::read_to_string(e.path()) {
+                if let Ok(r) = serde_json::from_str::<Receipt>(&raw) {
+                    entries.push(r);
+                }
+            }
+        }
+    }
+    if entries.is_empty() {
+        crate::ui::section("receipts");
+        println!("  none yet — served and consumed mesh requests leave signed receipts here");
+        return Ok(());
+    }
+    entries.sort_by_key(|r| r.ts);
+
+    crate::ui::section(&format!("receipts  ({})", entries.len()));
+    let (mut served, mut used, mut invalid) = (0u64, 0u64, 0u64);
+    for r in &entries {
+        let (server_ok, client_ok) = r.verify();
+        if !server_ok {
+            invalid += 1;
+        }
+        let (dir_label, counterpart) = if r.server_pub == me {
+            served += r.tokens_out;
+            ("served".green().to_string(), short_id(&r.client_pub))
+        } else if r.client_pub == me {
+            used += r.tokens_out;
+            ("used".cyan().to_string(), short_id(&r.server_pub))
+        } else {
+            ("other".dimmed().to_string(), short_id(&r.server_pub))
+        };
+        let sig = match (server_ok, client_ok) {
+            (true, true) => "✓✓".green().to_string(),
+            (true, false) => format!("✓{}", "–".dimmed()),
+            _ => "✗ invalid".red().to_string(),
+        };
+        println!(
+            "  {}  {:<7} {:<9}  {:<16} {:>6} tok  {}",
+            crate::usage::day_to_date(r.ts),
+            dir_label,
+            counterpart,
+            r.model,
+            r.tokens_out,
+            sig,
+        );
+    }
+    crate::ui::panel(
+        "reconciliation",
+        &[
+            ("served (out)".into(), format!("{served} tokens")),
+            ("used (out)".into(), format!("{used} tokens")),
+            (
+                "signatures".into(),
+                if invalid == 0 {
+                    "all valid".green().to_string()
+                } else {
+                    format!("{invalid} invalid").red().to_string()
+                },
+            ),
+        ],
+    );
+    Ok(())
+}
+
 // ── Pause / resume (cross-process reclaim, H3) ──────────────────────────────
 
 pub fn pause() -> Result<(), String> {

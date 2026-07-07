@@ -1,7 +1,10 @@
 # v2 Master Design — Local-First Decentralized AI Compute
 
-Status: implemented (Phases 1–4). `AGENTS.md` has the module map; this file is the
-architecture, invariants, and failure harnesses every change must continue to obey.
+Status: implemented (Phases 1–4) and proven end-to-end. `src/mesh/itest.rs` drives
+the full two-node path over real sockets against a mock Ollama — enrollment,
+streamed remote inference, dual-signed receipts, and immediate revocation.
+`AGENTS.md` has the module map; this file is the architecture, invariants, and
+failure harnesses every change must continue to obey.
 The transport uses direct Noise_XX over TCP (LAN / reachable host:port); swapping in
 iroh for NAT hole-punching is the one planned transport change and is isolated to
 `mesh/transport.rs`.

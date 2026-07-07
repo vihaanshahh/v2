@@ -12,7 +12,8 @@
 //! No async, no TLS PKI: one connection = one thread, framed messages.
 
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,32 @@ const PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const MAX_CHUNK: usize = 65_519;
 /// Reject absurd frames (defends against a peer claiming a huge length).
 const MAX_FRAME: usize = 1 << 20;
+
+// Timeouts so a dead or malicious peer can never hang a serving thread forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Short, applied during the handshake + auth exchange (defeats slowloris).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Generous, applied to the established session (bounds a stalled peer).
+const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(300);
+const SESSION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Dial with a connect timeout (never block indefinitely on a black-holed host).
+fn dial(addr: &str) -> Result<TcpStream, String> {
+    let mut last = String::from("no address resolved");
+    let addrs = addr.to_socket_addrs().map_err(|e| format!("resolve {addr}: {e}"))?;
+    for sa in addrs {
+        match TcpStream::connect_timeout(&sa, CONNECT_TIMEOUT) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(format!("connect {addr}: {last}"))
+}
+
+fn arm_handshake(stream: &TcpStream) {
+    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+}
 
 fn noise_err<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("noise: {e}"))
@@ -77,6 +104,12 @@ impl Channel {
     /// the connection aborts any in-flight upstream generation.
     pub fn shutdown(&mut self) {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Relax the short handshake timeouts to session values once authenticated.
+    fn relax_timeouts(&self) {
+        let _ = self.stream.set_read_timeout(Some(SESSION_READ_TIMEOUT));
+        let _ = self.stream.set_write_timeout(Some(SESSION_WRITE_TIMEOUT));
     }
 
     fn recv_chunk(&mut self) -> io::Result<Vec<u8>> {
@@ -257,8 +290,9 @@ pub fn connect_member(
     trusted_org_pub: &[u8; 32],
     revocations: &RevocationList,
 ) -> Result<(Channel, Peer), String> {
-    let mut stream = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    let mut stream = dial(addr)?;
     stream.set_nodelay(true).ok();
+    arm_handshake(&stream);
     let (noise, hash) = handshake(&mut stream, true)?;
     let mut ch = Channel { stream, noise, rbuf: Vec::new(), hash };
 
@@ -267,6 +301,7 @@ pub fn connect_member(
         .map_err(|e| format!("send auth: {e}"))?;
     let peer_auth: AuthMsg = ch.recv_json().map_err(|e| format!("recv auth: {e}"))?;
     let peer = verify_auth(&peer_auth, &h, trusted_org_pub, revocations)?;
+    ch.relax_timeouts();
     Ok((ch, peer))
 }
 
@@ -278,8 +313,9 @@ pub fn connect_enroll(
     trusted_org_pub: &[u8; 32],
     revocations: &RevocationList,
 ) -> Result<(Channel, Peer), String> {
-    let mut stream = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    let mut stream = dial(addr)?;
     stream.set_nodelay(true).ok();
+    arm_handshake(&stream);
     let (noise, hash) = handshake(&mut stream, true)?;
     let mut ch = Channel { stream, noise, rbuf: Vec::new(), hash };
 
@@ -289,6 +325,7 @@ pub fn connect_enroll(
     let peer_auth: AuthMsg = ch.recv_json().map_err(|e| format!("recv auth: {e}"))?;
     // The admin answering enrollment authenticates as a normal member.
     let peer = verify_auth(&peer_auth, &h, trusted_org_pub, revocations)?;
+    ch.relax_timeouts();
     Ok((ch, peer))
 }
 
@@ -303,6 +340,7 @@ pub fn accept(
 ) -> Result<(Channel, Peer), String> {
     let mut stream = stream;
     stream.set_nodelay(true).ok();
+    arm_handshake(&stream);
     let (noise, hash) = handshake(&mut stream, false)?;
     let mut ch = Channel { stream, noise, rbuf: Vec::new(), hash };
 
@@ -312,6 +350,7 @@ pub fn accept(
     let peer = verify_auth(&peer_auth, &h, trusted_org_pub, revocations)?;
     ch.send_json(&build_auth("member", node, &h, Some(my_cert), None))
         .map_err(|e| format!("send auth: {e}"))?;
+    ch.relax_timeouts();
     Ok((ch, peer))
 }
 

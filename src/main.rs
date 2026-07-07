@@ -198,6 +198,8 @@ enum MeshCmd {
     },
     /// List federated orgs and their scopes
     FederationList,
+    /// Verify and reconcile stored usage receipts
+    Receipts,
 }
 
 fn main() {
@@ -373,6 +375,7 @@ fn run_mesh(cmd: MeshCmd, hw: &hardware::HardwareInfo, ctx: u32) -> Result<(), S
         }
         MeshCmd::FederationAdd { org, note, models } => client::federation_add(&org, &note, &models),
         MeshCmd::FederationList => client::federation_list(),
+        MeshCmd::Receipts => client::receipts(),
     }
 }
 

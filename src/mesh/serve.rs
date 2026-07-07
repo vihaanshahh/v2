@@ -41,7 +41,6 @@ pub struct ServeCtx {
     pub paused: Arc<AtomicBool>,
     pub concurrent: Arc<AtomicU32>,
     pub used_vram_milli: Arc<AtomicU32>,
-    pub revocations: Arc<RevocationList>,
     pub quota: Arc<Mutex<HashMap<String, Vec<(u64, u64)>>>>,
     /// Admin only: lets this node enroll new members.
     pub org_root: Option<Arc<OrgRoot>>,
@@ -70,16 +69,24 @@ pub fn run(ctx: ServeCtx, listen: &str) -> Result<(), String> {
         short_id(&ctx.node.public_b64()),
         role
     );
+    serve_loop(ctx, listener);
+    Ok(())
+}
+
+/// Accept + dispatch connections on an already-bound listener. Blocks.
+pub fn serve_loop(ctx: ServeCtx, listener: TcpListener) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let ctx = ctx.clone();
         std::thread::spawn(move || handle(ctx, stream));
     }
-    Ok(())
 }
 
 fn handle(ctx: ServeCtx, stream: TcpStream) {
-    let revs = (*ctx.revocations).clone();
+    // Re-read the revocation list per connection so `v2 mesh revoke` takes effect
+    // immediately, without restarting the daemon. (Cross-node distribution still
+    // relies on the file being updated on each node + the 24h cert TTL.)
+    let revs = RevocationList::load();
     let (mut ch, peer) = match transport::accept(stream, &ctx.node, ctx.cert.clone(), &ctx.org_pub, &revs) {
         Ok(v) => v,
         Err(e) => {
@@ -175,16 +182,21 @@ fn serve_chat(
 
     ch.send_json(&Frame::Accepted).map_err(|e| e.to_string())?;
 
-    // ── H2: execute + stream, enforcing reclaim on every token ───────────────
+    // ── H2: execute + stream, enforcing reclaim + timeout on every token ─────
     let start = Instant::now();
     let paused = ctx.paused.clone();
     let activity = ctx.activity.clone();
     let cooldown = ctx.policy.availability.local_cooldown_s;
+    let timeout = std::time::Duration::from_secs(ctx.policy.serve.request_timeout_s.max(1));
 
     let mut abort: Option<String> = None;
     let stream_res = {
         let ch_ref = &mut *ch;
         ollama_api::chat_stream(&ctx.ollama_host, model, messages, |tok| {
+            if start.elapsed() > timeout {
+                abort = Some("preempted: request timeout".into());
+                return false;
+            }
             if paused.load(Ordering::SeqCst) {
                 abort = Some("preempted: node paused".into());
                 return false;
@@ -401,7 +413,6 @@ pub fn daemon(ollama_host: &str, hw: Arc<HardwareInfo>, activity: Activity, list
         paused,
         concurrent: Arc::new(AtomicU32::new(0)),
         used_vram_milli: Arc::new(AtomicU32::new(0)),
-        revocations: Arc::new(RevocationList::load()),
         quota: Arc::new(Mutex::new(HashMap::new())),
         org_root: OrgRoot::load().ok().map(Arc::new),
         used_nonces: Arc::new(Mutex::new(load_nonces())),

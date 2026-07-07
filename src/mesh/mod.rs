@@ -16,6 +16,9 @@ pub mod proto;
 pub mod serve;
 pub mod transport;
 
+#[cfg(test)]
+mod itest;
+
 use base64::Engine as _;
 
 /// Standard base64 (used for all keys/sigs on disk and on the wire).
