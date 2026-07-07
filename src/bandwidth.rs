@@ -46,6 +46,10 @@ pub fn gpu_bandwidth_gbps(gpu: &GpuInfo) -> (f64, bool) {
         ("mi300x", 5300.0), ("mi250", 3277.0), ("mi210", 1638.0),
         ("7900 xtx", 960.0), ("7900 xt", 800.0), ("7800 xt", 624.0),
         ("6950 xt", 576.0), ("6900 xt", 512.0), ("6800 xt", 512.0),
+        // AMD discrete GPUs found in Intel Macs
+        ("radeon pro 5600m", 394.0), ("radeon pro 5500m", 192.0), ("radeon pro 5300m", 192.0),
+        ("radeon pro vega 20", 164.0), ("radeon pro vega 16", 164.0),
+        ("radeon pro 560x", 96.0), ("radeon pro 555x", 96.0), ("radeon pro 580", 256.0),
         // Intel Arc
         ("a770", 560.0), ("a750", 512.0), ("a580", 512.0), ("a380", 186.0),
     ];
@@ -169,6 +173,9 @@ mod tests {
         assert_eq!(gpu_bandwidth_gbps(&g), (1008.0, true));
         let m = GpuInfo { name: "Apple M2 Max".into(), vendor: Vendor::Apple, vram_bytes: 0, shared_memory: true };
         assert_eq!(gpu_bandwidth_gbps(&m).0, 400.0);
+        // Mac discrete AMD GPU resolves exactly, not the generic AMD fallback.
+        let amd = GpuInfo { name: "AMD Radeon Pro 5300M".into(), vendor: Vendor::Amd, vram_bytes: 4 << 30, shared_memory: false };
+        assert_eq!(gpu_bandwidth_gbps(&amd), (192.0, true));
     }
 
     #[test]
