@@ -120,22 +120,25 @@ pub fn join(ticket_str: &str) -> Result<(), String> {
 
 pub fn status() -> Result<(), String> {
     let node = NodeKey::load_or_create()?;
-    println!("v2 mesh status");
-    println!("  node id  {}", short_id(&node.public_b64()));
+    let peers = PeersFile::load();
+    let mut rows = vec![("node".to_string(), short_id(&node.public_b64()))];
     match MeshIdentity::load()? {
-        None => println!("  member   {}  (run `v2 mesh init` or `v2 mesh join`)", "no".yellow()),
+        None => rows.push((
+            "member".into(),
+            format!("{}  — run `v2 mesh init` or `v2 mesh join`", "no".yellow()),
+        )),
         Some(ident) => {
-            let remaining = ident.cert.expiry.saturating_sub(now_unix());
-            println!("  org      {}", short_id(&ident.org_pub));
-            println!("  cert     valid for {}h", remaining / 3600);
+            let remaining = ident.cert.expiry.saturating_sub(now_unix()) / 3600;
             let admin = OrgRoot::load().is_ok();
-            println!("  role     {}", if admin { "admin".green() } else { "member".normal() });
+            rows.push(("org".into(), short_id(&ident.org_pub)));
+            rows.push(("role".into(), if admin { "admin".green().to_string() } else { "member".to_string() }));
+            rows.push(("cert".into(), format!("valid {remaining}h")));
         }
     }
-    let peers = PeersFile::load();
-    println!("  peers    {}", peers.peers.len());
+    rows.push(("peers".into(), peers.peers.len().to_string()));
+    crate::ui::panel("mesh status", &rows);
     for p in peers.peers {
-        println!("           {}", p.addr);
+        println!("  · {}", p.addr.dimmed());
     }
     Ok(())
 }
@@ -155,7 +158,7 @@ pub fn peers() -> Result<(), String> {
         println!("v2 mesh peers  none reachable  (add with `v2 mesh peer add host:port`)");
         return Ok(());
     }
-    println!("v2 mesh peers  {} reachable", cards.len());
+    crate::ui::section(&format!("mesh peers  ({} reachable)", cards.len()));
     for (addr, card) in &cards {
         println!(
             "  {:<22} {:<10} {:>5.0}G  {:>4.0} GB/s  {}/{} busy  {} models",

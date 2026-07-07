@@ -30,7 +30,8 @@ pub fn default_host() -> String {
 }
 
 pub fn fetch_local(host: &str) -> Result<Vec<Model>, String> {
-    let url = format!("{}/api/tags", host.trim_end_matches('/'));
+    let host = host.trim_end_matches('/');
+    let url = format!("{host}/api/tags");
     let resp = ureq::get(&url)
         .call()
         .map_err(|e| format!("ollama unreachable at {url}: {e}"))?;
@@ -39,7 +40,30 @@ pub fn fetch_local(host: &str) -> Result<Vec<Model>, String> {
         .into_json()
         .map_err(|e| format!("invalid ollama response: {e}"))?;
 
-    Ok(payload.models.into_iter().filter_map(parse_ollama_model).collect())
+    let mut models: Vec<Model> = payload.models.into_iter().filter_map(parse_ollama_model).collect();
+    // Replace the placeholder context length with the model's real value from
+    // /api/show (best-effort — falls back to the default if unavailable).
+    for m in &mut models {
+        if let Some(name) = m.ollama_name.clone() {
+            if let Some(ctx) = show_context_length(host, &name) {
+                m.context_length = ctx;
+            }
+        }
+    }
+    Ok(models)
+}
+
+/// Real max context length for a model, read from `/api/show` model_info
+/// (the key ends in `.context_length`, e.g. `qwen3.context_length`).
+fn show_context_length(host: &str, name: &str) -> Option<u32> {
+    let url = format!("{host}/api/show");
+    let resp = ureq::post(&url).send_json(ureq::json!({ "model": name })).ok()?;
+    let v: serde_json::Value = resp.into_json().ok()?;
+    let info = v.get("model_info")?.as_object()?;
+    info.iter()
+        .find(|(k, _)| k.ends_with(".context_length"))
+        .and_then(|(_, val)| val.as_u64())
+        .map(|n| n as u32)
 }
 
 fn parse_ollama_model(raw: OllamaModel) -> Option<Model> {

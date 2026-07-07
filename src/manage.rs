@@ -153,7 +153,7 @@ pub fn ps_installed(host: &str, hw: &HardwareInfo, ctx: u32) -> Result<(), Strin
         println!("v2 ps  no models installed  (try `v2 pull qwen3:8b`)");
         return Ok(());
     }
-    println!("v2 ps  {} installed", installed.len());
+    crate::ui::section(&format!("installed  ({})", installed.len()));
     let mut rows = installed;
     rows.sort_by(|a, b| a.display_name().cmp(b.display_name()));
     for m in &rows {

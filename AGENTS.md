@@ -25,7 +25,8 @@ the mesh only ever talks to v2. No Docker, no hosted coordination server — one
 | `src/models.rs` | `Model`, `Quant`, static catalog, param parsing |
 | `src/engine.rs` | VRAM math + fit classification (`FullGpu`, partial offload, CPU, too big) |
 | `src/bandwidth.rs` | Memory-bandwidth table + tok/s estimation (pure, always on) |
-| `src/display.rs` | Compact terminal + JSON output |
+| `src/ui.rs` | Terminal UI primitives — panels, sections, badges, bars (width-aware) |
+| `src/display.rs` | Scan output (framed panel + tables) and JSON |
 | `src/ollama.rs` | Fetch/parse local Ollama models |
 | `src/sources.rs` | Merge catalog + ollama, apply `--source` and allowlist |
 | `src/accepted.rs` | Load/filter enterprise allowlist (line file or JSON) |
@@ -81,11 +82,16 @@ Env vars: `OLLAMA_HOST`, `V2_ACCEPTED`. State lives under `~/.v2` (keys 0600).
 
 ## Editing rules
 
-- Keep the CLI output **compact** — one-line header, aligned columns, short fit tags.
+- Route human-facing output through `src/ui.rs` (panels, sections, badges) for a
+  consistent look; keep `--json` output stable and machine-readable.
+- Prefer real, detected values over hardcoded fallbacks: hardware via the OS,
+  Ollama context length via `/api/show`, hostname via the system, version via
+  `CARGO_PKG_VERSION`. Reference tables (model catalog, GPU bandwidth) are curated
+  real data — mark estimates with a `~`.
 - Prefer extending the catalog + Ollama tag map over one-off hacks in `engine.rs`.
 - Ollama models with known `size` + `quantization_level` use exact weight bytes; catalog models estimate from params.
 - Enterprise allowlist patterns support globs (`qwen3*`, `*:8b`).
-- Do not add markdown docs unless the user asks. Update this file when architecture changes.
+- User-facing docs live in `docs/` and `README.md`; update this file when architecture changes.
 - No emojis in code.
 
 ## Release

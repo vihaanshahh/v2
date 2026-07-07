@@ -6,6 +6,7 @@ mod hardware;
 mod models;
 mod ollama;
 mod sources;
+mod ui;
 
 #[cfg(feature = "daemon")]
 mod activity;
@@ -31,7 +32,16 @@ use models::Quant;
 use sources::{LoadOptions, ModelSource};
 
 #[derive(Parser)]
-#[command(name = "v2", version, about = "Which LLMs can you run on this machine?")]
+#[command(
+    name = "v2",
+    version,
+    about = "Which LLMs can you run — and how do you share that compute safely?",
+    long_about = "v2 detects your hardware and tells you which models fit and how fast, \
+                  manages them through Ollama, and can pool compute across your org over a \
+                  secure mesh.\n\nRun `v2 about` for a guided overview, or `v2 <command> --help` \
+                  for any command.",
+    after_help = "Examples:\n  v2                     scan and rank models\n  v2 pull qwen3:8b       fit-check then download\n  v2 serve               meter local usage\n  v2 mesh join <ticket>  join an org compute mesh\n\nDocs: https://github.com/vihaanshahh/v2"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -91,6 +101,8 @@ enum Cmd {
         #[arg(long, short)]
         quant: Option<String>,
     },
+    /// Show the logo, version, and a command overview
+    About,
     /// Run the metering proxy (and mesh serving, if a member)
     #[cfg(feature = "daemon")]
     Serve {
@@ -222,6 +234,9 @@ fn run() -> Result<(), String> {
                 run_scan(&hw, &load_opts, cli.ctx, cli.verbose, cli.family.as_deref(), false)?;
             }
         }
+        Some(Cmd::About) => {
+            print_about();
+        }
         Some(Cmd::Models) => {
             display::print_model_list(&sources::load(&load_opts)?);
         }
@@ -283,20 +298,19 @@ fn run() -> Result<(), String> {
         Some(Cmd::Top) => {
             let running = ollama_api::ps(&host)?;
             if running.is_empty() {
-                println!("v2 top  no models loaded");
+                ui::section("loaded");
+                println!("  nothing loaded in Ollama right now");
             } else {
-                println!("v2 top  {} loaded", running.len());
+                ui::section(&format!("loaded  ({})", running.len()));
                 for m in running {
-                    let vram = m.size_vram as f64 / (1024.0 * 1024.0 * 1024.0);
                     let total = m.size as f64 / (1024.0 * 1024.0 * 1024.0);
-                    let where_ = if m.size_vram >= m.size && m.size > 0 {
-                        "gpu".to_string()
-                    } else if m.size_vram == 0 {
-                        "cpu".to_string()
-                    } else {
-                        format!("{:.0}% gpu", m.size_vram as f64 / m.size as f64 * 100.0)
-                    };
-                    println!("  {:<28}  {:.1}G ({:.1}G vram, {})", m.name, total, vram, where_);
+                    let gpu_frac = if m.size > 0 { m.size_vram as f64 / m.size as f64 } else { 0.0 };
+                    println!(
+                        "  {}  {:>5.1}G  gpu {}",
+                        ui::pad(&m.name, 26),
+                        total,
+                        ui::bar(gpu_frac, 12),
+                    );
                 }
             }
         }
@@ -362,54 +376,87 @@ fn run_mesh(cmd: MeshCmd, hw: &hardware::HardwareInfo, ctx: u32) -> Result<(), S
     }
 }
 
-/// One actionable line per subsystem: binary, Ollama, identity, membership, policy.
+/// One badged line per subsystem: Ollama, identity, membership, policy.
 #[cfg(feature = "daemon")]
 fn doctor(host: &str, _hw: &hardware::HardwareInfo) {
-    use colored::Colorize;
-    let ok = "ok".green();
-    let warn = "!!".yellow();
-    let bad = "xx".red();
+    use ui::Badge;
+    ui::section("doctor");
 
-    println!("v2 doctor");
+    let line = |b: Badge, label: &str, msg: String| {
+        println!("  {}  {}  {}", ui::badge(b), ui::pad(label, 9), msg);
+    };
 
-    // Ollama reachability.
     match ollama::fetch_local(host) {
-        Ok(models) => println!("  [{ok}] ollama    reachable at {host} ({} models)", models.len()),
-        Err(e) => println!("  [{bad}] ollama    {e}\n           start it with `ollama serve`"),
+        Ok(models) => line(Badge::Ok, "ollama", format!("reachable at {host} · {} models", models.len())),
+        Err(e) => line(Badge::Bad, "ollama", format!("{e}\n              start it with `ollama serve`")),
     }
 
-    // Node identity.
     match mesh::identity::NodeKey::load_or_create() {
-        Ok(node) => println!("  [{ok}] identity  node {}", mesh::short_id(&node.public_b64())),
-        Err(e) => println!("  [{bad}] identity  {e}"),
+        Ok(node) => line(Badge::Ok, "identity", format!("node {}", mesh::short_id(&node.public_b64()))),
+        Err(e) => line(Badge::Bad, "identity", e),
     }
 
-    // Membership.
     match mesh::identity::MeshIdentity::load() {
         Ok(Some(ident)) => {
             let now = usage::now_unix();
             match ident.org_pub_bytes().and_then(|org| ident.cert.verify(&org, now)) {
                 Ok(()) => {
                     let h = ident.cert.expiry.saturating_sub(now) / 3600;
-                    println!("  [{ok}] mesh      member of org {} (cert valid {h}h)", mesh::short_id(&ident.org_pub));
+                    line(Badge::Ok, "mesh", format!("member of org {} · cert valid {h}h", mesh::short_id(&ident.org_pub)));
                 }
-                Err(e) => println!("  [{warn}] mesh      membership cert problem: {e}"),
+                Err(e) => line(Badge::Warn, "mesh", format!("membership cert problem: {e}")),
             }
         }
-        Ok(None) => println!("  [{warn}] mesh      not a member (run `v2 mesh init` or `v2 mesh join`)"),
-        Err(e) => println!("  [{warn}] mesh      {e}"),
+        Ok(None) => line(Badge::Warn, "mesh", "not a member (run `v2 mesh init` or `v2 mesh join`)".into()),
+        Err(e) => line(Badge::Warn, "mesh", e),
     }
 
-    // Policy.
     match policy::Policy::load() {
-        Ok(p) => println!(
-            "  [{ok}] policy    {} concurrent · {:.0}% VRAM · yield_to_local={}",
-            p.serve.max_concurrent_remote,
-            p.serve.max_vram_fraction * 100.0,
-            p.availability.yield_to_local
+        Ok(p) => line(
+            Badge::Ok,
+            "policy",
+            format!(
+                "{} remote job · {:.0}% VRAM cap · yield_to_local={}",
+                p.serve.max_concurrent_remote,
+                p.serve.max_vram_fraction * 100.0,
+                p.availability.yield_to_local
+            ),
         ),
-        Err(e) => println!("  [{bad}] policy    {e} (serving will refuse to start)"),
+        Err(e) => line(Badge::Bad, "policy", format!("{e} (serving will refuse to start)")),
     }
+    println!();
+}
+
+fn print_about() {
+    use colored::Colorize;
+    println!("{}", ui::logo());
+    println!("  {} {}", "v2".bold(), format!("v{}", ui::version()).dimmed());
+    println!(
+        "  {}\n",
+        "which LLMs can you run — and how do you share that compute safely?".dimmed()
+    );
+
+    ui::section("common commands");
+    let cmds = [
+        ("v2", "scan hardware, rank models by fit + speed"),
+        ("v2 check <model>", "check one model at every quant"),
+        ("v2 pull <model>", "fit-check, then download"),
+        ("v2 run <model>", "chat with a local model"),
+        ("v2 ps / top", "installed models / what's loaded now"),
+        ("v2 serve", "metering proxy (+ mesh serving)"),
+        ("v2 usage", "recorded token usage"),
+        ("v2 mesh init|join", "create or join an org compute mesh"),
+        ("v2 mesh run <model>", "run on the best org peer"),
+        ("v2 doctor", "diagnose ollama / identity / policy"),
+    ];
+    for (c, d) in cmds {
+        println!("  {}  {}", ui::pad(&c.cyan().to_string(), 22), d.dimmed());
+    }
+
+    ui::section("learn more");
+    println!("  {}  run any command with {}", ui::pad("help", 22), "--help".cyan());
+    println!("  {}  {}", ui::pad("docs", 22), "https://github.com/vihaanshahh/v2".cyan());
+    println!();
 }
 
 fn run_scan(

@@ -148,6 +148,34 @@ The full architecture, invariants, and failure harnesses are in
 
 ---
 
+## Documentation
+
+- **[docs/GUIDE.md](docs/GUIDE.md)** — getting started: scan, manage, meter.
+- **[docs/MESH.md](docs/MESH.md)** — the org mesh: setup, trust model, ops, federation.
+- **[docs/CONFIG.md](docs/CONFIG.md)** — `policy.toml`, the `~/.v2` file layout, env vars.
+- **[DESIGN.md](DESIGN.md)** — architecture, invariants, and failure harnesses.
+
+Or run `v2 about` for a guided overview and `v2 <command> --help` for any command.
+
+## Command reference
+
+| Command | Does |
+|---------|------|
+| `v2` | scan hardware, rank models by fit + speed |
+| `v2 check <model>` | check one model at every quant |
+| `v2 models` | list models from the configured source |
+| `v2 pull <model>` | fit-check, then download |
+| `v2 run <model>` | ensure installed, then chat |
+| `v2 ps` / `v2 top` | installed models / what's loaded now |
+| `v2 rm <model>` | remove an installed model |
+| `v2 serve` | metering proxy (`--mesh-listen` also serves the mesh) |
+| `v2 usage` | recorded token usage |
+| `v2 doctor` | diagnose Ollama / identity / policy |
+| `v2 mesh init\|invite\|join` | create / invite to / join an org mesh |
+| `v2 mesh run <model> <prompt>` | run on the best org peer |
+| `v2 mesh status\|peers\|pause\|resume` | inspect and control the mesh |
+| `v2 about` | logo, version, command overview |
+
 ## Build & test
 
 ```bash

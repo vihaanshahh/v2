@@ -16,30 +16,29 @@ pub fn print_hardware(
     accepted: Option<&AcceptedModels>,
 ) {
     let gpu = if hw.gpus.is_empty() {
-        "no gpu".yellow().to_string()
+        "none — CPU inference".yellow().to_string()
     } else {
         let g = &hw.gpus[0];
         let mem = if g.vram_bytes == 0 {
-            "?".to_string()
+            String::new()
         } else if g.shared_memory {
-            format!("{:.0}G unified", g.vram_bytes as f64 / GIB)
+            format!(" · {:.0}G unified", g.vram_bytes as f64 / GIB)
         } else {
-            format!("{:.0}G vram", g.vram_bytes as f64 / GIB)
+            format!(" · {:.0}G vram", g.vram_bytes as f64 / GIB)
         };
-        if hw.gpus.len() > 1 {
-            format!("{}× GPU {}", hw.gpus.len(), mem)
+        let extra = if hw.gpus.len() > 1 {
+            format!(" (+{} more)", hw.gpus.len() - 1)
         } else {
-            mem
-        }
+            String::new()
+        };
+        format!("{}{}{}", g.name, mem, extra)
     };
 
-    let ram = format!("{:.0}G ram", hw.ram_bytes as f64 / GIB);
     let ctx_k = if ctx >= 1000 {
-        format!("{}k ctx", ctx / 1000)
+        format!("{}k", ctx / 1000)
     } else {
-        format!("{} ctx", ctx)
+        ctx.to_string()
     };
-
     let source = match load_opts.source {
         crate::sources::ModelSource::Ollama => "ollama",
         crate::sources::ModelSource::Catalog => "catalog",
@@ -47,26 +46,23 @@ pub fn print_hardware(
         crate::sources::ModelSource::Auto => "auto",
     };
 
-    let policy = if accepted.is_some() || load_opts.enterprise {
-        " · enterprise".yellow().to_string()
-    } else {
-        String::new()
-    };
+    let mut rows = vec![
+        ("gpu".into(), gpu.cyan().to_string()),
+        (
+            "memory".into(),
+            format!("{:.0}G RAM · {}", hw.ram_bytes as f64 / GIB, hw.os),
+        ),
+        ("scan".into(), format!("ctx {ctx_k} · source {source}")),
+    ];
+    if accepted.is_some() || load_opts.enterprise {
+        rows.push(("policy".into(), "enterprise allowlist".yellow().to_string()));
+    }
 
-    println!(
-        "{}  {} · {} · {} · {} · {}{}",
-        "v2".bold(),
-        gpu.cyan(),
-        ram,
-        hw.os.to_string().dimmed(),
-        ctx_k.dimmed(),
-        source.dimmed(),
-        policy,
-    );
+    crate::ui::panel(&format!("v2 {} · which models fit", crate::ui::version()), &rows);
 }
 
 pub fn print_model_list(models: &[Model]) {
-    println!("{}  {} models", "v2".bold(), models.len());
+    crate::ui::section(&format!("models  ({})", models.len()));
     println!(
         "  {}  {:<22}  {:<7}  {:<8}  {}",
         "src".dimmed(),
@@ -130,7 +126,8 @@ pub fn print_results(
     let cant_run: Vec<_> = results.iter().filter(|(_, _, best)| best.is_none()).collect();
 
     if can_run.is_empty() {
-        println!("{}", "no models fit".red());
+        crate::ui::section("models");
+        println!("  {}", "nothing fits on this machine".red());
     } else {
         let mut rows: Vec<_> = can_run;
         rows.sort_by(|a, b| {
@@ -147,6 +144,7 @@ pub fn print_results(
                 })
         });
 
+        crate::ui::section(&format!("models that fit  ({})", rows.len()));
         println!(
             "  {}  {:<22}  {:<7}  {:<7}  {}",
             "fit".dimmed(),
@@ -197,13 +195,8 @@ pub fn print_results(
             .iter()
             .map(|(m, _, _)| model_label(m).to_string())
             .collect();
-        println!();
-        println!(
-            "  {} {} too large: {}",
-            "✗".red(),
-            cant_run.len(),
-            names.join(", ").dimmed()
-        );
+        crate::ui::section(&format!("too large  ({})", cant_run.len()));
+        println!("  {}", names.join(", ").dimmed());
     }
 }
 

@@ -119,7 +119,8 @@ pub fn print_summary(records: &[UsageRecord], json: bool) {
     }
 
     if records.is_empty() {
-        println!("v2 usage  no records yet ({})", "start `v2 serve` to meter");
+        crate::ui::section("usage");
+        println!("  no records yet — run `v2 serve` and route apps through :11435 to meter");
         return;
     }
 
@@ -151,11 +152,13 @@ pub fn print_summary(records: &[UsageRecord], json: bool) {
         total.duration_ms += r.duration_ms;
     }
 
-    println!(
-        "v2 usage  {} requests · {} in · {} out",
-        total.requests,
-        fmt_tokens(total.tokens_in),
-        fmt_tokens(total.tokens_out),
+    crate::ui::panel(
+        "usage",
+        &[
+            ("requests".into(), total.requests.to_string()),
+            ("tokens in".into(), fmt_tokens(total.tokens_in)),
+            ("tokens out".into(), fmt_tokens(total.tokens_out)),
+        ],
     );
 
     print_group("by day", by_day.into_iter().map(|(d, a)| (day_to_date(d * 86_400), a)));
@@ -164,7 +167,7 @@ pub fn print_summary(records: &[UsageRecord], json: bool) {
 }
 
 fn print_group<I: Iterator<Item = (String, Agg)>>(title: &str, rows: I) {
-    println!("\n  {}", title);
+    crate::ui::section(title);
     let mut rows: Vec<_> = rows.collect();
     rows.sort_by(|a, b| (b.1.tokens_out).cmp(&a.1.tokens_out));
     for (k, a) in rows.into_iter().take(12) {

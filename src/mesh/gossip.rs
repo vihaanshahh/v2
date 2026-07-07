@@ -69,6 +69,17 @@ pub fn local_card(node_pub: &str, hw: &HardwareInfo, installed: &[String], concu
 }
 
 fn hostname() -> String {
+    // Real system hostname, cross-platform.
+    if let Ok(out) = std::process::Command::new("hostname").output() {
+        if out.status.success() {
+            if let Ok(s) = String::from_utf8(out.stdout) {
+                let h = s.trim().split('.').next().unwrap_or("").to_string();
+                if !h.is_empty() {
+                    return h;
+                }
+            }
+        }
+    }
     std::env::var("HOSTNAME")
         .ok()
         .or_else(|| std::env::var("COMPUTERNAME").ok())
