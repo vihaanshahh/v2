@@ -13,8 +13,9 @@ clap = { version = "4", features = ["derive"] }
 colored = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# No TLS backend: v2 only speaks localhost HTTP (Ollama) and raw-TCP+Noise
-# (mesh), so we drop ureq's rustls/ring — smaller binary, trivial cross-compile.
+# Base build is TLS-free: the scan + local Ollama only need localhost HTTP, and
+# the mesh is raw-TCP+Noise. The `remote` feature (on in the daemon build) adds
+# ureq's rustls so hosted endpoints (Modal, vLLM, …) reachable over HTTPS work.
 ureq = { version = "2", features = ["json"], default-features = false }
 
 # Daemon + mesh (feature "daemon", on by default). The plain `v2` scan builds
@@ -28,7 +29,11 @@ base64 = { version = "0.22", optional = true }
 
 [features]
 default = ["daemon"]
-daemon = ["dep:tiny_http", "dep:snow", "dep:ed25519-dalek", "dep:getrandom", "dep:toml", "dep:base64"]
+daemon = ["dep:tiny_http", "dep:snow", "dep:ed25519-dalek", "dep:getrandom", "dep:toml", "dep:base64", "remote"]
+# Remote hosted endpoints (e.g. a model on Modal) speak HTTPS, so this feature
+# re-enables ureq's rustls TLS. Kept separate so the plain scan binary
+# (--no-default-features) stays TLS-free and tiny (H6).
+remote = ["ureq/tls"]
 
 [profile.release]
 opt-level = 3

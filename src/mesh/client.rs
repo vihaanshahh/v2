@@ -235,9 +235,9 @@ pub fn receipts() -> Result<(), String> {
             ("other".dimmed().to_string(), short_id(&r.server_pub))
         };
         let sig = match (server_ok, client_ok) {
-            (true, true) => "✓✓".green().to_string(),
-            (true, false) => format!("✓{}", "–".dimmed()),
-            _ => "✗ invalid".red().to_string(),
+            (true, true) => "valid".green().to_string(),
+            (true, false) => "partial".dimmed().to_string(),
+            _ => "invalid".red().to_string(),
         };
         println!(
             "  {}  {:<7} {:<9}  {:<16} {:>6} tok  {}",

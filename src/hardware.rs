@@ -456,6 +456,39 @@ fn detect_cpu_name(os: &Os) -> String {
     }
 }
 
+// ── Disk ──────────────────────────────────────────────────────────────────────
+
+/// Best-effort free bytes on the filesystem that holds `path` (where Ollama
+/// stores model weights). Shells out like the rest of detection; returns `None`
+/// if the platform tool is missing or its output can't be parsed, so callers
+/// degrade gracefully to "disk space unknown".
+pub fn disk_free_bytes(path: &std::path::Path) -> Option<u64> {
+    let p = path.to_string_lossy();
+    match detect_os() {
+        Os::Linux | Os::MacOs => {
+            // POSIX `df -Pk` -> "Filesystem 1024-blocks Used Available Capacity Mounted".
+            let out = Command::new("df").args(["-Pk", &p]).output().ok()?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            let data = text.lines().nth(1)?; // skip the header row
+            let avail_kb: u64 = data.split_whitespace().nth(3)?.parse().ok()?;
+            Some(avail_kb * 1024)
+        }
+        Os::Windows => {
+            // Drive letter of the path (e.g. "C:"), default to C: if absent.
+            let drive = p.split(':').next().map(|d| format!("{d}:")).unwrap_or_else(|| "C:".into());
+            let out = Command::new("wmic")
+                .args(["logicaldisk", "where", &format!("DeviceID='{drive}'"), "get", "FreeSpace", "/value"])
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.lines()
+                .find(|l| l.contains("FreeSpace="))
+                .and_then(|l| l.split('=').nth(1))
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
