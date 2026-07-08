@@ -8,6 +8,7 @@
 //! written from the reader's Drop, so partial usage is never lost.
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,8 +16,24 @@ use crate::activity::Activity;
 use crate::ollama_api::GenStats;
 use crate::usage::{self, UsageRecord};
 
+/// A live, runtime-adjustable cap on the CPU threads Ollama may use per request.
+/// `0` means no cap. Shared with the interactive panel so you can dial it while
+/// serving. Applied by injecting `options.num_thread` into requests that don't
+/// already set it — the one lever a request-level wrapper has over Ollama.
+pub type CpuLimit = Arc<AtomicUsize>;
+
+/// Hard ceiling on a single request body we'll buffer in memory. Generous enough
+/// for base64-encoded vision images, but bounded so a runaway or malicious client
+/// can't OOM the daemon by streaming an endless (or decompression-bombed) body.
+/// Anything larger is rejected with 413 before we read it all.
+const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
+
+/// Ceiling on an upstream error body we buffer to forward verbatim. Error
+/// payloads are tiny JSON; cap them so a broken upstream can't balloon memory.
+const MAX_ERROR_BODY: u64 = 1024 * 1024;
+
 /// Run the metering proxy until the process is stopped. Blocks.
-pub fn serve(listen: &str, ollama_host: &str, activity: Activity) -> Result<(), String> {
+pub fn serve(listen: &str, ollama_host: &str, activity: Activity, cpu_limit: CpuLimit) -> Result<(), String> {
     let server = tiny_http::Server::http(listen)
         .map_err(|e| format!("cannot bind {listen}: {e}"))?;
     let ollama_host = Arc::new(ollama_host.trim_end_matches('/').to_string());
@@ -26,9 +43,11 @@ pub fn serve(listen: &str, ollama_host: &str, activity: Activity) -> Result<(), 
     for request in server.incoming_requests() {
         let host = ollama_host.clone();
         let act = activity.clone();
+        // Snapshot the cap per request so panel changes take effect immediately.
+        let threads = cpu_limit.load(Ordering::Relaxed);
         // Thread per request: concurrent local apps, blocking I/O, no async.
         std::thread::spawn(move || {
-            if let Err(e) = handle(request, &host, &act) {
+            if let Err(e) = handle(request, &host, &act, threads) {
                 eprintln!("v2 proxy: {e}");
             }
         });
@@ -36,7 +55,7 @@ pub fn serve(listen: &str, ollama_host: &str, activity: Activity) -> Result<(), 
     Ok(())
 }
 
-fn handle(mut request: tiny_http::Request, ollama_host: &str, activity: &Activity) -> Result<(), String> {
+fn handle(mut request: tiny_http::Request, ollama_host: &str, activity: &Activity, cpu_threads: usize) -> Result<(), String> {
     activity.touch();
 
     let method = request.method().as_str().to_string();
@@ -44,13 +63,26 @@ fn handle(mut request: tiny_http::Request, ollama_host: &str, activity: &Activit
     let model = String::new(); // filled in below if we can see it in the body
 
     // Read the incoming body (the prompt). In memory only — never written to disk.
+    // Bounded by MAX_REQUEST_BODY: we read one byte past the limit so we can tell
+    // "exactly at the cap" from "over it", then refuse anything over with 413
+    // instead of buffering an unbounded (or bomb-sized) payload.
     let mut body = Vec::new();
     request
         .as_reader()
+        .take(MAX_REQUEST_BODY as u64 + 1)
         .read_to_end(&mut body)
         .map_err(|e| format!("read body: {e}"))?;
+    if body.len() > MAX_REQUEST_BODY {
+        let response = tiny_http::Response::from_string("request body too large")
+            .with_status_code(413);
+        let _ = request.respond(response);
+        return Ok(());
+    }
 
     let model = detect_model(&body).unwrap_or(model);
+    // Cap CPU usage by asking Ollama for fewer inference threads, unless the
+    // caller already specified their own num_thread.
+    let body = if cpu_threads > 0 { cap_cpu_threads(body, cpu_threads) } else { body };
 
     let upstream_url = format!("{ollama_host}{url}");
     let mut req = ureq::request(&method, &upstream_url);
@@ -68,8 +100,9 @@ fn handle(mut request: tiny_http::Request, ollama_host: &str, activity: &Activit
     let resp = match resp {
         Ok(r) => r,
         Err(ureq::Error::Status(code, r)) => {
-            // Forward upstream error responses verbatim.
-            let bytes = crate::ollama_api::drain(r.into_reader());
+            // Forward upstream error responses verbatim, but bounded — an error
+            // body should be tiny JSON, never megabytes.
+            let bytes = crate::ollama_api::drain(r.into_reader().take(MAX_ERROR_BODY));
             let response = tiny_http::Response::from_data(bytes).with_status_code(code);
             let _ = request.respond(response);
             return Ok(());
@@ -107,6 +140,65 @@ fn header_value(request: &tiny_http::Request, name: &str) -> Option<String> {
 fn detect_model(body: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     v.get("model")?.as_str().map(|s| s.to_string())
+}
+
+/// Inject `options.num_thread = threads` into a generate/chat body so Ollama
+/// doesn't peg every core. Only touches JSON objects carrying a "model" and
+/// never overrides a num_thread the caller set. Any non-JSON or unexpected body
+/// is forwarded byte-for-byte, so the proxy stays transparent.
+fn cap_cpu_threads(body: Vec<u8>, threads: usize) -> Vec<u8> {
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    if v.get("model").is_none() {
+        return body;
+    }
+    let Some(obj) = v.as_object_mut() else { return body };
+    let options = obj.entry("options").or_insert_with(|| serde_json::json!({}));
+    match options.as_object_mut() {
+        Some(opts) if !opts.contains_key("num_thread") => {
+            opts.insert("num_thread".into(), serde_json::json!(threads));
+        }
+        _ => return body, // already set, or options isn't an object — leave it
+    }
+    serde_json::to_vec(&v).unwrap_or(body)
+}
+
+/// Whether a `host:port` listen address binds to loopback only — i.e. the proxy
+/// is reachable from this machine but not from the network. Anything else
+/// (`0.0.0.0`, a LAN IP, `::`) is exposed and gets a warning.
+pub fn is_loopback(listen: &str) -> bool {
+    let host = listen.rsplit_once(':').map(|(h, _)| h).unwrap_or(listen);
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
+}
+
+/// Logical CPU count on this machine (fallback 1), used to turn a percentage
+/// CPU budget into a concrete thread cap.
+pub fn cpu_cores() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// Parse a `--cpu` spec into a thread cap. Accepts a percentage ("50%") or an
+/// absolute thread count ("4"). Empty or "0" means unlimited. Result is clamped
+/// to `[1, cores]` for any positive request.
+pub fn parse_cpu_spec(spec: &str, cores: usize) -> Result<usize, String> {
+    let s = spec.trim();
+    if s.is_empty() || s == "0" {
+        return Ok(0);
+    }
+    if let Some(pct) = s.strip_suffix('%') {
+        let pct: f64 = pct.trim().parse().map_err(|_| format!("bad cpu percent: {spec}"))?;
+        if pct <= 0.0 {
+            return Ok(0);
+        }
+        let n = ((pct / 100.0) * cores as f64).round() as usize;
+        return Ok(n.clamp(1, cores.max(1)));
+    }
+    let n: usize = s
+        .parse()
+        .map_err(|_| format!("cpu limit must be a thread count or percent (e.g. 4 or 50%), got: {spec}"))?;
+    Ok(n.min(cores.max(1)))
 }
 
 /// A Read that passes bytes through unchanged while extracting Ollama's
@@ -238,6 +330,41 @@ mod tests {
         assert_eq!(stats.prompt_eval_count, 11);
         assert_eq!(stats.eval_count, 42);
         assert!(stats.done);
+    }
+
+    #[test]
+    fn cpu_cap_injects_num_thread_without_clobbering_callers() {
+        // No options at all -> options.num_thread added.
+        let out = cap_cpu_threads(br#"{"model":"m","prompt":"hi"}"#.to_vec(), 4);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["options"]["num_thread"], 4);
+        // Caller already set num_thread -> untouched.
+        let body = br#"{"model":"m","options":{"num_thread":16}}"#.to_vec();
+        let out = cap_cpu_threads(body.clone(), 4);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["options"]["num_thread"], 16);
+        // Non-model body (e.g. /api/tags) and non-JSON pass through verbatim.
+        assert_eq!(cap_cpu_threads(b"not json".to_vec(), 4), b"not json");
+        assert_eq!(cap_cpu_threads(br#"{"name":"x"}"#.to_vec(), 4), br#"{"name":"x"}"#);
+    }
+
+    #[test]
+    fn loopback_detection_locks_down_local_binds() {
+        assert!(is_loopback("127.0.0.1:11435"));
+        assert!(is_loopback("localhost:11435"));
+        assert!(is_loopback("[::1]:11435"));
+        assert!(!is_loopback("0.0.0.0:11435"));
+        assert!(!is_loopback("192.168.1.20:11435"));
+    }
+
+    #[test]
+    fn cpu_spec_parses_percent_and_count() {
+        assert_eq!(parse_cpu_spec("", 8).unwrap(), 0);
+        assert_eq!(parse_cpu_spec("0", 8).unwrap(), 0);
+        assert_eq!(parse_cpu_spec("50%", 8).unwrap(), 4);
+        assert_eq!(parse_cpu_spec("4", 8).unwrap(), 4);
+        assert_eq!(parse_cpu_spec("100", 8).unwrap(), 8); // clamped to cores
+        assert!(parse_cpu_spec("banana", 8).is_err());
     }
 
     #[test]

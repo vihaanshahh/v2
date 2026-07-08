@@ -11,6 +11,10 @@ mod ui;
 #[cfg(feature = "daemon")]
 mod activity;
 #[cfg(feature = "daemon")]
+mod console;
+#[cfg(feature = "daemon")]
+mod endpoints;
+#[cfg(feature = "daemon")]
 mod manage;
 #[cfg(feature = "daemon")]
 mod mesh;
@@ -25,6 +29,8 @@ mod proxy;
 #[cfg(feature = "daemon")]
 mod usage;
 
+#[cfg(feature = "daemon")]
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -112,6 +118,12 @@ enum Cmd {
         /// Also accept mesh peers on this address (requires membership)
         #[arg(long)]
         mesh_listen: Option<String>,
+        /// Cap CPU Ollama uses: a thread count (e.g. 4) or percent (e.g. 50%)
+        #[arg(long)]
+        cpu: Option<String>,
+        /// Run the blocking proxy with no interactive panel (for systemd/daemons)
+        #[arg(long)]
+        headless: bool,
     },
     /// Show models currently loaded in Ollama
     #[cfg(feature = "daemon")]
@@ -282,10 +294,22 @@ fn run() -> Result<(), String> {
             }
         }
         #[cfg(feature = "daemon")]
-        Some(Cmd::Serve { listen, mesh_listen }) => {
+        Some(Cmd::Serve { listen, mesh_listen, cpu, headless }) => {
             let activity = activity::Activity::new();
+            let hw = std::sync::Arc::new(hw);
+            let cores = proxy::cpu_cores();
+            let initial_cpu = proxy::parse_cpu_spec(cpu.as_deref().unwrap_or(""), cores)?;
+            let cpu_limit: proxy::CpuLimit = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(initial_cpu));
+            // Lockdown: the proxy is meant to be loopback-only. Shout if it isn't.
+            if !proxy::is_loopback(&listen) {
+                eprintln!(
+                    "warning: --listen {listen} is reachable from the network — anyone who can reach \
+                     this host can use your Ollama. Bind 127.0.0.1 unless you mean to expose it."
+                );
+            }
+            let mesh_addr = mesh_listen.clone();
             if let Some(ml) = mesh_listen {
-                let hw_arc = std::sync::Arc::new(hw);
+                let hw_arc = hw.clone();
                 let host2 = host.clone();
                 let act2 = activity.clone();
                 std::thread::spawn(move || {
@@ -294,7 +318,24 @@ fn run() -> Result<(), String> {
                     }
                 });
             }
-            proxy::serve(&listen, &host, activity)?;
+            let interactive = !headless
+                && std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal();
+            if interactive {
+                // Proxy in the background; interactive control panel in front.
+                let host2 = host.clone();
+                let listen2 = listen.clone();
+                let act2 = activity.clone();
+                let cpu2 = cpu_limit.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = proxy::serve(&listen2, &host2, act2, cpu2) {
+                        eprintln!("v2 proxy: {e}");
+                    }
+                });
+                console::run(&host, hw.as_ref(), cli.ctx, &listen, mesh_addr.as_deref(), &cpu_limit, cores)?;
+            } else {
+                proxy::serve(&listen, &host, activity, cpu_limit)?;
+            }
         }
         #[cfg(feature = "daemon")]
         Some(Cmd::Top) => {

@@ -1,6 +1,8 @@
 # AGENTS.md
 
-Scope: the whole `v2` repo. This is a single Rust CLI binary — no frontend, no server.
+Scope: the whole `v2` repo. This is a single Rust CLI binary — no web frontend, no
+hosted server. `v2 serve` presents an interactive terminal control panel (line-based,
+no extra deps); `--headless` keeps the old blocking proxy for systemd/daemons.
 
 ## What v2 does
 
@@ -39,7 +41,9 @@ Daemon feature (`--features daemon`, default on; excluded by `--no-default-featu
 | `src/usage.rs` | Append-only JSONL metering store + summaries |
 | `src/activity.rs` | Shared local-activity signal (yield-to-local) |
 | `src/ollama_api.rs` | Ollama ps/pull/chat/delete (streaming) |
-| `src/proxy.rs` | `serve` metering proxy on :11435 |
+| `src/proxy.rs` | `serve` metering proxy on :11435 (loopback by default; `is_loopback` gates a lockdown warning) + `--cpu` thread cap (injects `options.num_thread`) |
+| `src/console.rs` | interactive `serve` panel: one numbered model list driving find→install→open→close→limit→delete (TTY only, resize-aware, disk-guarded installs, usage glance) |
+| `src/endpoints.rs` | registry for hosted remote models (e.g. Modal) in `~/.v2/endpoints.json`; OpenAI-compatible + remote-Ollama streaming chat. Needs the `remote` feature (ureq TLS) for HTTPS |
 | `src/manage.rs` | `pull`/`run`/`rm`/`ps` — fit-aware wrappers |
 | `src/policy.rs` | `policy.toml` + H1 admission gate (pure, tested) |
 | `src/mesh/identity.rs` | ed25519 keys, org root, certs, tickets, revocation, federation |

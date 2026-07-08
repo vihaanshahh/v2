@@ -89,6 +89,17 @@ pub fn delete(host: &str, model: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Unload a model from memory now, without deleting its weights. Ollama frees a
+/// model when `keep_alive` reaches 0, so a zero-length generate with
+/// `keep_alive: 0` closes it immediately. This is "close", not "delete".
+pub fn stop(host: &str, model: &str) -> Result<(), String> {
+    let url = format!("{}/api/generate", host.trim_end_matches('/'));
+    ureq::post(&url)
+        .send_json(ureq::json!({ "model": model, "keep_alive": 0 }))
+        .map_err(|e| format!("close failed: {e}"))?;
+    Ok(())
+}
+
 /// One turn of `POST /api/chat` (streamed). `on_token` receives each content
 /// delta and returns `false` to abort the stream (dropping the upstream
 /// connection, which makes Ollama stop generating — the reclaim/deadman path).

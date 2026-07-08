@@ -62,6 +62,24 @@ fn box_width() -> usize {
     cols().min(MAX_W)
 }
 
+/// Truncate a plain string to a visible width, adding `…` if it was cut. Meant
+/// for pre-colour text (call before applying ANSI), so lines never overflow a
+/// narrow terminal and wrap. Widths ≤ 1 collapse to the ellipsis alone.
+pub fn truncate(s: &str, width: usize) -> String {
+    if visible_len(s) <= width {
+        return s.to_string();
+    }
+    if width <= 1 {
+        return "…".to_string();
+    }
+    let mut out = String::new();
+    for c in s.chars().take(width - 1) {
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
 /// A rounded, titled panel of label/value rows:
 ///
 /// ```text
