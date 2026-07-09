@@ -75,21 +75,26 @@ v2 ps                                       # installed models with fit info
 
 `v2 serve` runs a metering proxy in front of Ollama and exposes an
 **OpenAI-compatible API**, so any OpenAI SDK/tool can point its Base URL at v2.
+The `/v1` surface is **key-gated by default** — v2 auto-creates and persists a
+key at `~/.v2/api_key` on first run, so it's safe to expose with zero setup.
 
 ```bash
-# Optional: gate the /v1 surface with a bearer token before exposing it.
-export V2_API_KEY="$(head -c24 /dev/urandom | base64)"
-
 nohup v2 serve --listen 127.0.0.1:11435 --headless >/tmp/v2-serve.log 2>&1 &
 curl -s --retry 20 --retry-all-errors -o /dev/null http://127.0.0.1:11435/api/tags  # wait
+v2 endpoint                       # prints the paste-ready Base URL + key + models
 ```
 
-Point a client at it:
+Knobs (all optional):
+- `V2_API_KEY=<key>` — pin a specific key instead of the auto-generated one.
+- `V2_PUBLIC_URL=https://…` — advertise a public/tunnel URL as the Base URL (behind a reverse proxy or a platform service).
+- `V2_OPEN=1` — disable the gate entirely (only for trusted loopback use).
+
+Point a client at it (values come straight from `v2 endpoint`):
 
 | Field         | Value                                  |
 | ------------- | -------------------------------------- |
-| **Base URL**  | `http://127.0.0.1:11435/v1`            |
-| **API Key**   | value of `$V2_API_KEY` (any string if unset) |
+| **Base URL**  | `http://127.0.0.1:11435/v1` (or your `V2_PUBLIC_URL`) |
+| **API Key**   | the key from `v2 endpoint` / `~/.v2/api_key` |
 | **Model ID**  | any model from `GET /v1/models`        |
 
 ```bash

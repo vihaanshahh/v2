@@ -17,11 +17,79 @@ use crate::endpoints::{self, ApiKind};
 use crate::ollama_api::GenStats;
 use crate::usage::{self, UsageRecord};
 
-/// Optional bearer token guarding the OpenAI-compatible `/v1/*` surface. When
-/// `V2_API_KEY` is set, `/v1` requests must carry `Authorization: Bearer <key>`;
-/// unset means open (fine for the default loopback bind, not for exposed ones).
-fn api_key() -> Option<String> {
-    std::env::var("V2_API_KEY").ok().filter(|k| !k.is_empty())
+/// Bearer token guarding the OpenAI-compatible `/v1/*` surface. Resolution order:
+///   1. `V2_OPEN=1` (or true/yes/on) → no gate. Explicit opt-out for trusted,
+///      loopback-only use where you want zero auth.
+///   2. `V2_API_KEY` set & non-empty → use it verbatim (what a managed service sets).
+///   3. otherwise → load-or-create a persisted key at `~/.v2/api_key`.
+/// So `/v1` is **key-gated by default** and safe to expose with no setup — you
+/// never have to invent or wire a key yourself.
+fn resolved_api_key() -> Option<String> {
+    let open = std::env::var("V2_OPEN")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if open {
+        return None;
+    }
+    if let Ok(k) = std::env::var("V2_API_KEY") {
+        if !k.trim().is_empty() {
+            return Some(k);
+        }
+    }
+    load_or_create_key()
+}
+
+/// Read the persisted key, generating (and 0600-storing) one on first use.
+fn load_or_create_key() -> Option<String> {
+    let path = crate::paths::file("api_key").ok()?;
+    if let Ok(k) = std::fs::read_to_string(&path) {
+        let k = k.trim().to_string();
+        if !k.is_empty() {
+            return Some(k);
+        }
+    }
+    let mut raw = [0u8; 18];
+    getrandom::getrandom(&mut raw).ok()?;
+    let key = format!("sk-v2-{}", raw.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    let _ = std::fs::write(&path, &key);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Some(key)
+}
+
+/// Print a paste-ready description of the OpenAI-compatible endpoint: the Base
+/// URL(s), the API key, and installed model ids. `V2_PUBLIC_URL` (if set) is
+/// shown as the primary Base URL so a reverse-proxied/tunnelled deployment
+/// advertises its real address. Callable standalone via `v2 endpoint`.
+pub fn print_endpoint_banner(listen: &str, ollama_host: &str) {
+    let public = std::env::var("V2_PUBLIC_URL").ok().map(|u| u.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty());
+    let key = resolved_api_key();
+    let models: Vec<String> = crate::ollama::fetch_local(ollama_host)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| m.ollama_name)
+        .collect();
+
+    let mut rows: Vec<(String, String)> = Vec::new();
+    if let Some(p) = &public {
+        rows.push(("Base URL".into(), format!("{p}/v1")));
+        rows.push(("(local)".into(), format!("http://{listen}/v1")));
+    } else {
+        rows.push(("Base URL".into(), format!("http://{listen}/v1")));
+    }
+    rows.push((
+        "API key".into(),
+        key.clone().unwrap_or_else(|| "open — no key (V2_OPEN set)".into()),
+    ));
+    rows.push((
+        "Models".into(),
+        if models.is_empty() { "(none installed — run `v2 pull <model>`)".into() } else { models.join(", ") },
+    ));
+    crate::ui::panel("OpenAI-compatible endpoint", &rows);
+    println!("  Point any OpenAI tool here: Base URL + API key + a Model ID.");
 }
 
 /// A live, runtime-adjustable cap on the CPU threads Ollama may use per request.
@@ -47,6 +115,7 @@ pub fn serve(listen: &str, ollama_host: &str, activity: Activity, cpu_limit: Cpu
     let ollama_host = Arc::new(ollama_host.trim_end_matches('/').to_string());
 
     println!("v2 proxy  {listen} -> {ollama_host}  (metering local usage)");
+    print_endpoint_banner(listen, &ollama_host);
 
     for request in server.incoming_requests() {
         let host = ollama_host.clone();
@@ -77,7 +146,7 @@ fn handle(mut request: tiny_http::Request, ollama_host: &str, activity: &Activit
     // optional bearer token so an exposed bind isn't an open relay to your keys.
     let is_openai = url.starts_with("/v1/");
     if is_openai {
-        if let Some(key) = api_key() {
+        if let Some(key) = resolved_api_key() {
             if header_value(&request, "authorization").as_deref() != Some(&format!("Bearer {key}")) {
                 let response = tiny_http::Response::from_string("{\"error\":{\"message\":\"invalid or missing api key\",\"type\":\"invalid_request_error\"}}")
                     .with_status_code(401);

@@ -129,6 +129,14 @@ enum Cmd {
         #[arg(long)]
         headless: bool,
     },
+    /// Print the OpenAI-compatible endpoint (Base URL + API key + models) to
+    /// paste into any OpenAI tool. Auto-creates a key if none exists.
+    #[cfg(feature = "daemon")]
+    Endpoint {
+        /// The address v2 serves on (must match your `v2 serve --listen`)
+        #[arg(long, default_value = "127.0.0.1:11435")]
+        listen: String,
+    },
     /// Show models currently loaded in Ollama
     #[cfg(feature = "daemon")]
     Top,
@@ -359,6 +367,10 @@ fn run() -> Result<(), String> {
             } else {
                 proxy::serve(&listen, &host, activity, cpu_limit)?;
             }
+        }
+        #[cfg(feature = "daemon")]
+        Some(Cmd::Endpoint { listen }) => {
+            proxy::print_endpoint_banner(&listen, &host);
         }
         #[cfg(feature = "daemon")]
         Some(Cmd::Top) => {
