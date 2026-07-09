@@ -25,9 +25,24 @@ pub struct NodeCard {
     pub bandwidth_gbps: f64,
     /// Installed Ollama model tags.
     pub models: Vec<String>,
+    /// Hosted endpoints this node can broker into the mesh.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_models: Vec<RemoteModel>,
     /// Current remote jobs / configured ceiling.
     pub concurrent: u32,
     pub max_concurrent: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteModel {
+    /// Friendly endpoint name chosen by the owner.
+    pub name: String,
+    /// Provider model id the endpoint expects.
+    pub model: String,
+    /// API shape, e.g. openai or ollama.
+    pub kind: String,
+    /// Compact host label for display.
+    pub host: String,
 }
 
 impl NodeCard {
@@ -36,11 +51,18 @@ impl NodeCard {
         self.models.iter().any(|t| {
             let t = t.to_lowercase();
             t == m || t.starts_with(&format!("{m}:")) || m.starts_with(&t)
-        })
+        }) || self.remote_models.iter().any(|r| r.serves_model(model))
     }
 
     pub fn has_capacity(&self) -> bool {
         self.max_concurrent == 0 || self.concurrent < self.max_concurrent
+    }
+}
+
+impl RemoteModel {
+    pub fn serves_model(&self, model: &str) -> bool {
+        let model = model.trim();
+        self.model == model || self.name == model || self.name.eq_ignore_ascii_case(model)
     }
 }
 
@@ -63,6 +85,7 @@ pub fn local_card(node_pub: &str, hw: &HardwareInfo, installed: &[String], concu
         vram_gb: (vram_gb * 10.0).round() / 10.0,
         bandwidth_gbps: bw,
         models: installed.to_vec(),
+        remote_models: Vec::new(),
         concurrent,
         max_concurrent,
     }
@@ -112,12 +135,48 @@ impl PeersFile {
     pub fn save(&self) -> Result<(), String> {
         let dir = paths::subdir("mesh").map_err(|e| e.to_string())?;
         let raw = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(dir.join("peers.json"), raw).map_err(|e| e.to_string())
+        paths::write_private(&dir.join("peers.json"), raw.as_bytes()).map_err(|e| e.to_string())
     }
 
     pub fn add(&mut self, addr: &str) {
         if !self.peers.iter().any(|p| p.addr == addr) {
             self.peers.push(PeerEntry { addr: addr.to_string(), node_pub: None });
         }
+    }
+
+    pub fn add_with_node(&mut self, addr: &str, node_pub: &str) {
+        if let Some(p) = self.peers.iter_mut().find(|p| p.addr == addr) {
+            if p.node_pub.is_none() {
+                p.node_pub = Some(node_pub.to_string());
+            }
+        } else {
+            self.peers.push(PeerEntry { addr: addr.to_string(), node_pub: Some(node_pub.to_string()) });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_card_matches_local_and_remote_models() {
+        let card = NodeCard {
+            models: vec!["qwen3:8b".into()],
+            remote_models: vec![RemoteModel {
+                name: "zo".into(),
+                model: "meta-llama/Llama-3.1-8B-Instruct".into(),
+                kind: "openai".into(),
+                host: "zo.example".into(),
+            }],
+            max_concurrent: 1,
+            ..NodeCard::default()
+        };
+
+        assert!(card.serves_model("qwen3"));
+        assert!(card.serves_model("zo"));
+        assert!(card.serves_model("ZO"));
+        assert!(card.serves_model("meta-llama/Llama-3.1-8B-Instruct"));
+        assert!(!card.serves_model("meta-llama/llama-3.1-8b-instruct"));
     }
 }

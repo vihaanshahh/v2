@@ -6,8 +6,6 @@
 //! text log you can `cat`, `grep`, or ship.
 
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -52,8 +50,7 @@ fn try_append(rec: &UsageRecord) -> std::io::Result<()> {
     let path = dir.join(format!("day-{}.jsonl", epoch_day(rec.ts)));
     let mut line = serde_json::to_string(rec).unwrap_or_default();
     line.push('\n');
-    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-    f.write_all(line.as_bytes())
+    paths::append_private(&path, line.as_bytes())
 }
 
 /// Read every record across all daily logs, skipping torn/invalid lines.

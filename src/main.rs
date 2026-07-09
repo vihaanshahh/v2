@@ -370,7 +370,7 @@ fn run() -> Result<(), String> {
         }
         #[cfg(feature = "daemon")]
         Some(Cmd::Endpoint { listen }) => {
-            proxy::print_endpoint_banner(&listen, &host);
+            proxy::print_endpoint_banner(&listen, &host, true)?;
         }
         #[cfg(feature = "daemon")]
         Some(Cmd::Top) => {

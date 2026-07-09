@@ -46,6 +46,13 @@ fn dial(addr: &str) -> Result<TcpStream, String> {
     }
 }
 
+fn expected_relay_node(addr: &str) -> Option<String> {
+    match super::relay::parse_route(addr) {
+        super::relay::Route::Relay { node_pub, .. } => Some(node_pub),
+        super::relay::Route::Direct(_) => None,
+    }
+}
+
 /// Dial with a connect timeout (never block indefinitely on a black-holed host).
 fn dial_direct(addr: &str) -> Result<TcpStream, String> {
     let mut last = String::from("no address resolved");
@@ -284,6 +291,7 @@ pub fn connect_member(
     trusted_org_pub: &[u8; 32],
     revocations: &RevocationList,
 ) -> Result<(Channel, Peer), String> {
+    let expected = expected_relay_node(addr);
     let mut stream = dial(addr)?;
     stream.set_nodelay(true).ok();
     arm_handshake(&stream);
@@ -295,6 +303,11 @@ pub fn connect_member(
         .map_err(|e| format!("send auth: {e}"))?;
     let peer_auth: AuthMsg = ch.recv_json().map_err(|e| format!("recv auth: {e}"))?;
     let peer = verify_auth(&peer_auth, &h, trusted_org_pub, revocations)?;
+    if let Some(expected) = expected {
+        if peer.node_pub() != expected {
+            return Err(format!("relay target identity mismatch: expected {expected}, got {}", peer.node_pub()));
+        }
+    }
     ch.relax_timeouts();
     Ok((ch, peer))
 }
@@ -307,6 +320,7 @@ pub fn connect_enroll(
     trusted_org_pub: &[u8; 32],
     revocations: &RevocationList,
 ) -> Result<(Channel, Peer), String> {
+    let expected = expected_relay_node(addr);
     let mut stream = dial(addr)?;
     stream.set_nodelay(true).ok();
     arm_handshake(&stream);
@@ -319,6 +333,11 @@ pub fn connect_enroll(
     let peer_auth: AuthMsg = ch.recv_json().map_err(|e| format!("recv auth: {e}"))?;
     // The admin answering enrollment authenticates as a normal member.
     let peer = verify_auth(&peer_auth, &h, trusted_org_pub, revocations)?;
+    if let Some(expected) = expected {
+        if peer.node_pub() != expected {
+            return Err(format!("relay target identity mismatch: expected {expected}, got {}", peer.node_pub()));
+        }
+    }
     ch.relax_timeouts();
     Ok((ch, peer))
 }

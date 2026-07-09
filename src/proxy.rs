@@ -13,97 +13,182 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::activity::Activity;
-use crate::endpoints::{self, ApiKind};
+use crate::endpoints;
 use crate::ollama_api::GenStats;
 use crate::usage::{self, UsageRecord};
 
-/// The `[endpoint]` section of `~/.v2/policy.toml` (defaults if absent/unreadable).
-fn endpoint_cfg() -> crate::policy::EndpointPolicy {
-    crate::policy::Policy::load().map(|p| p.endpoint).unwrap_or_default()
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthMode {
+    Open,
+    Key(String),
+}
+
+/// The `[endpoint]` section of `~/.v2/policy.toml` (defaults if absent).
+fn endpoint_cfg() -> Result<crate::policy::EndpointPolicy, String> {
+    crate::policy::Policy::load().map(|p| p.endpoint)
 }
 
 /// Bearer token guarding the OpenAI-compatible `/v1/*` surface. Resolution order
 /// (env overrides config so a managed platform can inject values):
-///   1. `V2_OPEN=1` env or `endpoint.open = true` → no gate. Trusted local use only.
+///   1. `V2_OPEN=1` env or `endpoint.open = true` -> no gate, but only on
+///      loopback with no public URL advertised.
 ///   2. `V2_API_KEY` env, else `endpoint.api_key` config → use it verbatim.
 ///   3. otherwise → load-or-create a persisted key at `~/.v2/api_key`.
 /// So `/v1` is **key-gated by default** and safe to expose with no setup — you
 /// never have to invent or wire a key yourself.
-fn resolved_api_key() -> Option<String> {
-    let cfg = endpoint_cfg();
-    let env_open = std::env::var("V2_OPEN")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    if env_open || cfg.open {
-        return None;
+fn auth_mode(listen: &str) -> Result<AuthMode, String> {
+    let cfg = endpoint_cfg()?;
+    if open_requested(&cfg) {
+        if !is_loopback(listen) || public_url_raw(&cfg).is_some() {
+            return Err("endpoint.open/V2_OPEN is only allowed on loopback with no public URL".into());
+        }
+        return Ok(AuthMode::Open);
     }
     if let Ok(k) = std::env::var("V2_API_KEY") {
         if !k.trim().is_empty() {
-            return Some(k);
+            return Ok(AuthMode::Key(k));
         }
     }
     if !cfg.api_key.trim().is_empty() {
-        return Some(cfg.api_key);
+        return Ok(AuthMode::Key(cfg.api_key));
     }
-    load_or_create_key()
+    load_or_create_key().map(AuthMode::Key)
+}
+
+fn open_requested(cfg: &crate::policy::EndpointPolicy) -> bool {
+    std::env::var("V2_OPEN")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+        || cfg.open
+}
+
+fn public_url_raw(cfg: &crate::policy::EndpointPolicy) -> Option<String> {
+    std::env::var("V2_PUBLIC_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| (!cfg.public_url.trim().is_empty()).then_some(cfg.public_url.clone()))
 }
 
 /// Read the persisted key, generating (and 0600-storing) one on first use.
-fn load_or_create_key() -> Option<String> {
-    let path = crate::paths::file("api_key").ok()?;
-    if let Ok(k) = std::fs::read_to_string(&path) {
-        let k = k.trim().to_string();
-        if !k.is_empty() {
-            return Some(k);
+fn load_or_create_key() -> Result<String, String> {
+    let path = crate::paths::file("api_key").map_err(|e| e.to_string())?;
+    match std::fs::read_to_string(&path) {
+        Ok(k) => {
+            let k = k.trim().to_string();
+            if !k.is_empty() {
+                return Ok(k);
+            }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
     }
-    let mut raw = [0u8; 18];
-    getrandom::getrandom(&mut raw).ok()?;
-    let key = format!("sk-v2-{}", raw.iter().map(|b| format!("{b:02x}")).collect::<String>());
-    let _ = std::fs::write(&path, &key);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    let key = generate_api_key()?;
+    write_api_key(&path, &key).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(key)
+}
+
+fn generate_api_key() -> Result<String, String> {
+    let mut raw = [0u8; 32];
+    getrandom::getrandom(&mut raw).map_err(|e| format!("rng failure: {e}"))?;
+    Ok(format!("sk-v2-{}", raw.iter().map(|b| format!("{b:02x}")).collect::<String>()))
+}
+
+fn write_api_key(path: &std::path::Path, key: &str) -> std::io::Result<()> {
+    crate::paths::write_private(path, key.as_bytes())
+}
+
+fn auth_description(auth: &AuthMode, reveal_key: bool) -> String {
+    match auth {
+        AuthMode::Open => "open (loopback only)".into(),
+        AuthMode::Key(key) if reveal_key => key.clone(),
+        AuthMode::Key(key) => format!("{} (hidden; run `v2 endpoint` to show)", mask_key(key)),
     }
-    Some(key)
+}
+
+fn mask_key(key: &str) -> String {
+    if key.len() <= 12 {
+        "set".into()
+    } else {
+        format!("{}...{}", &key[..8], &key[key.len() - 4..])
+    }
+}
+
+fn protect_all_paths(listen: &str) -> Result<bool, String> {
+    let cfg = endpoint_cfg()?;
+    Ok(!is_loopback(listen) || public_url_raw(&cfg).is_some())
+}
+
+fn require_bearer(request: &tiny_http::Request, auth: &AuthMode) -> bool {
+    match auth {
+        AuthMode::Open => true,
+        AuthMode::Key(key) => bearer_ok(header_value(request, "authorization").as_deref(), key),
+    }
 }
 
 /// Print a paste-ready description of the OpenAI-compatible endpoint: the Base
 /// URL(s), the API key, and installed model ids. `V2_PUBLIC_URL` (if set) is
 /// shown as the primary Base URL so a reverse-proxied/tunnelled deployment
 /// advertises its real address. Callable standalone via `v2 endpoint`.
-pub fn print_endpoint_banner(listen: &str, ollama_host: &str) {
+pub fn print_endpoint_banner(listen: &str, ollama_host: &str, reveal_key: bool) -> Result<(), String> {
     // Public URL: env wins, then the `[endpoint] public_url` config.
-    let public = std::env::var("V2_PUBLIC_URL")
-        .ok()
-        .or_else(|| Some(endpoint_cfg().public_url))
-        .map(|u| u.trim().trim_end_matches('/').to_string())
-        .filter(|u| !u.is_empty());
-    let key = resolved_api_key();
-    let models: Vec<String> = crate::ollama::fetch_local(ollama_host)
+    let cfg = endpoint_cfg()?;
+    let public = match public_url_raw(&cfg) {
+        Some(raw) => Some(normalize_public_base_url(&raw)?),
+        None => None,
+    };
+    let auth = auth_mode(listen)?;
+    let mut models: Vec<String> = crate::ollama::fetch_local(ollama_host)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|m| m.ollama_name)
         .collect();
+    for ep in endpoints::load() {
+        models.extend(endpoints::aliases(&ep));
+    }
 
     let mut rows: Vec<(String, String)> = Vec::new();
     if let Some(p) = &public {
         rows.push(("Base URL".into(), format!("{p}/v1")));
-        rows.push(("(local)".into(), format!("http://{listen}/v1")));
+        rows.push(("(local)".into(), format!("{}/v1", local_base_url(listen))));
     } else {
-        rows.push(("Base URL".into(), format!("http://{listen}/v1")));
+        rows.push(("Base URL".into(), format!("{}/v1", local_base_url(listen))));
     }
-    rows.push((
-        "API key".into(),
-        key.clone().unwrap_or_else(|| "open — no key (V2_OPEN set)".into()),
-    ));
+    rows.push(("API key".into(), auth_description(&auth, reveal_key)));
     rows.push((
         "Models".into(),
         if models.is_empty() { "(none installed — run `v2 pull <model>`)".into() } else { models.join(", ") },
     ));
     crate::ui::panel("OpenAI-compatible endpoint", &rows);
     println!("  Point any OpenAI tool here: Base URL + API key + a Model ID.");
+    Ok(())
+}
+
+fn normalize_public_base_url(raw: &str) -> Result<String, String> {
+    crate::endpoints::normalize_base_url(raw, crate::endpoints::ApiKind::Openai)
+}
+
+fn local_base_url(listen: &str) -> String {
+    let (raw_host, port) = listen_host_port(listen);
+    let host = match raw_host.trim().trim_start_matches('[').trim_end_matches(']') {
+        "" | "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+        h => h.to_string(),
+    };
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    format!("http://{host}:{port}")
+}
+
+fn listen_host_port(listen: &str) -> (&str, &str) {
+    if let Some(rest) = listen.strip_prefix('[') {
+        if let Some((host, tail)) = rest.split_once(']') {
+            let port = tail.strip_prefix(':').unwrap_or("11435");
+            return (host, port);
+        }
+    }
+    listen.rsplit_once(':').unwrap_or((listen, "11435"))
 }
 
 /// A live, runtime-adjustable cap on the CPU threads Ollama may use per request.
@@ -124,21 +209,24 @@ const MAX_ERROR_BODY: u64 = 1024 * 1024;
 
 /// Run the metering proxy until the process is stopped. Blocks.
 pub fn serve(listen: &str, ollama_host: &str, activity: Activity, cpu_limit: CpuLimit) -> Result<(), String> {
+    let auth = auth_mode(listen)?;
+    let protect_all = protect_all_paths(listen)?;
     let server = tiny_http::Server::http(listen)
         .map_err(|e| format!("cannot bind {listen}: {e}"))?;
     let ollama_host = Arc::new(ollama_host.trim_end_matches('/').to_string());
 
     println!("v2 proxy  {listen} -> {ollama_host}  (metering local usage)");
-    print_endpoint_banner(listen, &ollama_host);
+    print_endpoint_banner(listen, &ollama_host, false)?;
 
     for request in server.incoming_requests() {
         let host = ollama_host.clone();
         let act = activity.clone();
+        let auth = auth.clone();
         // Snapshot the cap per request so panel changes take effect immediately.
         let threads = cpu_limit.load(Ordering::Relaxed);
         // Thread per request: concurrent local apps, blocking I/O, no async.
         std::thread::spawn(move || {
-            if let Err(e) = handle(request, &host, &act, threads) {
+            if let Err(e) = handle(request, &host, &act, threads, &auth, protect_all) {
                 eprintln!("v2 proxy: {e}");
             }
         });
@@ -146,29 +234,35 @@ pub fn serve(listen: &str, ollama_host: &str, activity: Activity, cpu_limit: Cpu
     Ok(())
 }
 
-fn handle(mut request: tiny_http::Request, ollama_host: &str, activity: &Activity, cpu_threads: usize) -> Result<(), String> {
+fn handle(
+    mut request: tiny_http::Request,
+    ollama_host: &str,
+    activity: &Activity,
+    cpu_threads: usize,
+    auth: &AuthMode,
+    protect_all: bool,
+) -> Result<(), String> {
     activity.touch();
 
     let method = request.method().as_str().to_string();
     let url = request.url().to_string();
+    let path = request_path(&url).to_string();
     let model = String::new(); // filled in below if we can see it in the body
 
     // ── OpenAI-compatible surface (`/v1/*`) ──────────────────────────────────
     // Lets any OpenAI SDK / tool point its Base URL at v2. Local models flow
     // straight to Ollama's native `/v1`; a model id registered as a remote
     // endpoint is reverse-proxied there with its stored key. Guarded by an
-    // optional bearer token so an exposed bind isn't an open relay to your keys.
-    let is_openai = url.starts_with("/v1/");
-    if is_openai {
-        if let Some(key) = resolved_api_key() {
-            if header_value(&request, "authorization").as_deref() != Some(&format!("Bearer {key}")) {
-                let response = tiny_http::Response::from_string("{\"error\":{\"message\":\"invalid or missing api key\",\"type\":\"invalid_request_error\"}}")
-                    .with_status_code(401);
-                let _ = request.respond(response);
-                return Ok(());
-            }
+    // bearer token so an exposed bind isn't an open relay to your keys.
+    let is_openai = path == "/v1" || path.starts_with("/v1/");
+    if is_openai || protect_all {
+        if !require_bearer(&request, auth) {
+            let response = tiny_http::Response::from_string("{\"error\":{\"message\":\"invalid or missing api key\",\"type\":\"invalid_request_error\"}}")
+                .with_status_code(401);
+            let _ = request.respond(response);
+            return Ok(());
         }
-        if method == "GET" && url.trim_end_matches('/').ends_with("/v1/models") {
+        if method == "GET" && path == "/v1/models" {
             return respond_openai_models(request, ollama_host);
         }
     }
@@ -196,19 +290,24 @@ fn handle(mut request: tiny_http::Request, ollama_host: &str, activity: &Activit
     // id matching a registered OpenAI endpoint (by model id or friendly name) is
     // reverse-proxied to that host with its stored key and canonical model id.
     let mut upstream_base = ollama_host.to_string();
-    let mut auth: Option<String> = None;
+    let mut upstream_auth: Option<String> = None;
     let mut body = body;
     if is_openai {
-        if let Some(ep) = endpoints::load()
-            .into_iter()
-            .find(|e| e.kind == ApiKind::Openai && (e.model == model || e.name == model))
+        if let Some(ep) = endpoints::find_model(&model)
+            .filter(|e| e.kind == endpoints::ApiKind::Openai)
         {
-            // Base may or may not already end in `/v1`; the request path carries
-            // its own `/v1`, so strip a trailing one to avoid `/v1/v1`.
-            let base = ep.url.trim_end_matches('/');
-            upstream_base = base.strip_suffix("/v1").unwrap_or(base).to_string();
-            auth = ep.api_key.clone();
-            body = rewrite_model(body, &ep.model);
+            if method == "POST" && path == "/v1/chat/completions" {
+                // Base may or may not already end in `/v1`; the request path carries
+                // its own `/v1`, so strip a trailing one to avoid `/v1/v1`.
+                upstream_base = endpoints::normalize_base_url(&ep.url, ep.kind)?;
+                upstream_auth = ep.api_key.clone();
+                body = rewrite_model(body, &ep.model);
+            } else {
+                let response = tiny_http::Response::from_string("{\"error\":{\"message\":\"remote endpoints only support /v1/chat/completions\",\"type\":\"invalid_request_error\"}}")
+                    .with_status_code(404);
+                let _ = request.respond(response);
+                return Ok(());
+            }
         }
     }
     let routed_remote = upstream_base != ollama_host;
@@ -223,7 +322,7 @@ fn handle(mut request: tiny_http::Request, ollama_host: &str, activity: &Activit
         req = req.set("Content-Type", &ct);
     }
     // Inject the endpoint's own key (never the caller's) when routed remotely.
-    if let Some(key) = auth.as_deref().filter(|k| !k.is_empty()) {
+    if let Some(key) = upstream_auth.as_deref().filter(|k| !k.is_empty()) {
         req = req.set("Authorization", &format!("Bearer {key}"));
     }
 
@@ -272,6 +371,28 @@ fn header_value(request: &tiny_http::Request, name: &str) -> Option<String> {
         .map(|h| h.value.as_str().to_string())
 }
 
+fn request_path(url: &str) -> &str {
+    let path = url.split('?').next().unwrap_or(url).trim_end_matches('/');
+    if path.is_empty() { "/" } else { path }
+}
+
+fn bearer_ok(header: Option<&str>, key: &str) -> bool {
+    let Some(header) = header else { return false };
+    let Some(token) = header.trim().strip_prefix("Bearer ") else { return false };
+    constant_time_eq(token.as_bytes(), key.as_bytes())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Best-effort model name from a request body ({"model": "..."}).
 fn detect_model(body: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
@@ -302,7 +423,10 @@ fn respond_openai_models(request: tiny_http::Request, ollama_host: &str) -> Resu
         push(&tag, "ollama");
     }
     for ep in endpoints::load() {
-        push(&ep.model, &format!("endpoint:{}", ep.name));
+        let owner = format!("endpoint:{}", ep.name);
+        for id in endpoints::aliases(&ep) {
+            push(&id, &owner);
+        }
     }
     let payload = serde_json::json!({ "object": "list", "data": data }).to_string();
     let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
@@ -534,6 +658,25 @@ mod tests {
         assert!(is_loopback("[::1]:11435"));
         assert!(!is_loopback("0.0.0.0:11435"));
         assert!(!is_loopback("192.168.1.20:11435"));
+    }
+
+    #[test]
+    fn base_url_display_normalizes_public_and_local_binds() {
+        assert_eq!(
+            normalize_public_base_url("https://example.com/v1").unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(local_base_url("0.0.0.0:11435"), "http://127.0.0.1:11435");
+        assert_eq!(local_base_url("[::]:11435"), "http://127.0.0.1:11435");
+        assert_eq!(local_base_url("192.168.1.20:11435"), "http://192.168.1.20:11435");
+    }
+
+    #[test]
+    fn bearer_check_requires_exact_constant_time_token() {
+        assert!(bearer_ok(Some("Bearer sk-v2-abc"), "sk-v2-abc"));
+        assert!(!bearer_ok(Some("Bearer sk-v2-abd"), "sk-v2-abc"));
+        assert!(!bearer_ok(Some("sk-v2-abc"), "sk-v2-abc"));
+        assert!(!bearer_ok(None, "sk-v2-abc"));
     }
 
     #[test]

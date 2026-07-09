@@ -77,11 +77,28 @@ impl NodeKey {
 
 /// Write 0600 where the platform supports it.
 fn write_secret(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    std::fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        f.write_all(bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        f.write_all(bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -285,7 +302,7 @@ impl FederationList {
     pub fn save(&self) -> Result<(), String> {
         let dir = paths::subdir("mesh").map_err(|e| e.to_string())?;
         let raw = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(dir.join("federation.json"), raw).map_err(|e| e.to_string())
+        paths::write_private(&dir.join("federation.json"), raw.as_bytes()).map_err(|e| e.to_string())
     }
 
     /// Trusted org public keys (decoded), for cert verification.
@@ -333,7 +350,7 @@ impl RevocationList {
     pub fn save(&self) -> Result<(), String> {
         let dir = paths::subdir("mesh").map_err(|e| e.to_string())?;
         let raw = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(dir.join("revoked.json"), raw).map_err(|e| e.to_string())
+        paths::write_private(&dir.join("revoked.json"), raw.as_bytes()).map_err(|e| e.to_string())
     }
 
     /// Add a revocation (verified against the org key before storing).
@@ -411,7 +428,7 @@ impl MeshIdentity {
     pub fn save(&self) -> Result<(), String> {
         let dir = paths::subdir("mesh").map_err(|e| e.to_string())?;
         let raw = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(dir.join("org.json"), raw).map_err(|e| e.to_string())
+        paths::write_private(&dir.join("org.json"), raw.as_bytes()).map_err(|e| e.to_string())
     }
 
     pub fn org_pub_bytes(&self) -> Result<[u8; 32], String> {

@@ -101,7 +101,14 @@ v2 serve --mesh-listen 0.0.0.0:4830
 ```bash
 v2 mesh join <ticket>             # the entire member setup
 v2 mesh run qwen3:32b "explain quicksort"
+v2 mesh run zo "use the hosted endpoint named zo"
 ```
+
+Registered hosted endpoints you add in `v2 serve` stay local by default. Set
+`endpoint.share_in_mesh = true` when you want peers to spend those provider keys;
+then the mesh can use a hosted deployment and your laptops through the same command.
+Endpoint URLs are normalized when saved: OpenAI-style `/v1` roots and Ollama `/api`
+roots collapse to one canonical base URL, and bare private IPs default to `http://`.
 
 **Share your own machine safely** — `v2 serve --mesh-listen …`, governed by
 `~/.v2/policy.toml`. A machine with **no config is already safe**: one remote job at a
@@ -124,13 +131,18 @@ yield_to_local   = true    # the moment you use the machine, remote work is evic
 
 [endpoint]                       # the OpenAI-compatible /v1 surface (v2 serve)
 public_url = "https://your-host" # advertise this as the Base URL (clients get <url>/v1)
-# api_key  = ""                  # empty → auto-persisted key at ~/.v2/api_key
+# api_key  = ""                  # empty → auto 256-bit key at ~/.v2/api_key
 # open     = false               # true → no bearer gate (loopback-only trust)
+# share_in_mesh = false          # true → peers may use registered hosted endpoints
 ```
 
 The `/v1` surface is **key-gated by default** — v2 auto-creates a key at
-`~/.v2/api_key` on first serve, so exposing it needs no setup. Run
-`v2 endpoint` any time to print the paste-ready Base URL + key + model list.
+`~/.v2/api_key` on first serve. If you put it on the public internet, use a TLS
+tunnel or reverse proxy; `v2 endpoint` prints the paste-ready Base URL + key +
+model list. `v2 serve` redacts the key in long-running daemon output.
+If you bind `--listen 0.0.0.0:11435`, the local Base URL is shown as
+`127.0.0.1` because `0.0.0.0` is a bind address, not a client address; set
+`V2_PUBLIC_URL` / `endpoint.public_url` to advertise a tunnel or DNS name.
 
 **Get your laptop back, instantly:**
 
@@ -150,6 +162,9 @@ The safety isn't monitoring code that could itself fail — it's structural:
 - **Deadman by design.** Every remote generation is a held-open stream. If the daemon
   dies, the peer disconnects, or you reclaim, the connection drops and Ollama stops
   generating. The failure state *is* the safe state.
+- **Keyed endpoint by default.** `/v1` requires a bearer token unless you explicitly
+  set `V2_OPEN=1` or `endpoint.open=true` on loopback with no public URL. On
+  exposed/public setups, all proxy paths require the bearer key.
 - **Expiry beats revocation.** Membership certs live 24h and auto-renew while trusted.
   Even if a revocation message never arrives, a revoked node stops working within the TTL.
 - **Fail closed on trust, fail open on function.** Any doubt about identity drops the
@@ -182,6 +197,7 @@ including a job terminated **mid-generation** by owner reclaim.
 - **[docs/GUIDE.md](docs/GUIDE.md)** — getting started: scan, manage, meter.
 - **[docs/MESH.md](docs/MESH.md)** — the org mesh: setup, trust model, ops, federation.
 - **[docs/CONFIG.md](docs/CONFIG.md)** — `policy.toml`, the `~/.v2` file layout, env vars.
+- **[docs/DESKTOP_APP.md](docs/DESKTOP_APP.md)** — lightweight desktop app plan for click-to-join/chat/share.
 - **[DESIGN.md](DESIGN.md)** — architecture, invariants, and failure harnesses.
 
 Or run `v2 about` for a guided overview and `v2 <command> --help` for any command.

@@ -7,7 +7,7 @@
 //!
 //! HTTPS works because the daemon build enables the `remote` feature (ureq TLS).
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,8 @@ use crate::paths;
 
 /// Reachability check + model discovery shouldn't hang on a dead host.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
+const CHAT_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_ENDPOINT_ERROR_BODY: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -42,6 +44,120 @@ pub struct Endpoint {
     pub api_key: Option<String>,
 }
 
+/// Stable labels this endpoint can be addressed by from v2 surfaces.
+pub fn aliases(ep: &Endpoint) -> Vec<String> {
+    let mut out = vec![ep.name.clone()];
+    if ep.model != ep.name {
+        out.push(ep.model.clone());
+    }
+    out
+}
+
+/// Whether a caller's requested model should route to this endpoint. Friendly
+/// endpoint names are case-insensitive; provider model ids are exact.
+pub fn matches_model(ep: &Endpoint, model: &str) -> bool {
+    let model = model.trim();
+    ep.model == model || ep.name == model || ep.name.eq_ignore_ascii_case(model)
+}
+
+/// Registered endpoint matching a requested model id or friendly endpoint name.
+pub fn find_model(model: &str) -> Option<Endpoint> {
+    load().into_iter().find(|ep| matches_model(ep, model))
+}
+
+pub fn kind_label(kind: ApiKind) -> &'static str {
+    match kind {
+        ApiKind::Openai => "openai",
+        ApiKind::Ollama => "ollama",
+    }
+}
+
+/// Canonical upstream root for an endpoint. We accept the common forms users
+/// paste into the panel:
+///   - host:port                 -> http://host:port for local/private IPs
+///   - api.example.com           -> https://api.example.com
+///   - https://host/v1           -> https://host     (OpenAI-compatible)
+///   - http://host:11434/api     -> http://host:11434 (Ollama)
+pub fn normalize_base_url(input: &str, kind: ApiKind) -> Result<String, String> {
+    let mut u = input.trim().trim_end_matches('/').to_string();
+    if u.is_empty() {
+        return Err("endpoint url is required".into());
+    }
+    if u.contains('?') || u.contains('#') {
+        return Err("endpoint url must not include a query string or fragment".into());
+    }
+    if u.contains("://") && !u.starts_with("http://") && !u.starts_with("https://") {
+        return Err("endpoint url must use http:// or https://".into());
+    }
+    if !u.starts_with("http://") && !u.starts_with("https://") {
+        u = format!("{}://{}", default_scheme(&u), u);
+    }
+    let authority = u
+        .split_once("://")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+        .unwrap_or("");
+    if authority.contains('@') {
+        return Err("endpoint url must not include username or password".into());
+    }
+    match kind {
+        ApiKind::Openai => {
+            u = strip_suffix_ci(u, "/v1/chat/completions");
+            u = strip_suffix_ci(u, "/v1/models");
+            u = strip_suffix_ci(u, "/v1");
+        }
+        ApiKind::Ollama => {
+            u = strip_suffix_ci(u, "/api/chat");
+            u = strip_suffix_ci(u, "/api/tags");
+            u = strip_suffix_ci(u, "/api");
+        }
+    }
+    Ok(u.trim_end_matches('/').to_string())
+}
+
+fn strip_suffix_ci(mut s: String, suffix: &str) -> String {
+    if s.to_lowercase().ends_with(&suffix.to_lowercase()) {
+        let keep = s.len().saturating_sub(suffix.len());
+        s.truncate(keep);
+        s.truncate(s.trim_end_matches('/').len());
+    }
+    s
+}
+
+fn default_scheme(raw: &str) -> &'static str {
+    let host = raw.split('/').next().unwrap_or(raw);
+    let host = host.rsplit_once('@').map(|(_, h)| h).unwrap_or(host);
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    let host = host.trim_matches(['[', ']']);
+    if host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("0.0.0.0")
+        || host == "::1"
+        || host == "::"
+        || host.starts_with("127.")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("169.254.")
+        || host.ends_with(".local")
+        || !host.contains('.')
+        || is_private_172(host)
+    {
+        "http"
+    } else {
+        "https"
+    }
+}
+
+fn is_private_172(host: &str) -> bool {
+    let mut parts = host.split('.');
+    match (parts.next(), parts.next()) {
+        (Some("172"), Some(second)) => second.parse::<u8>().map(|n| (16..=31).contains(&n)).unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn store_path() -> Result<std::path::PathBuf, String> {
     paths::file("endpoints.json").map_err(|e| e.to_string())
 }
@@ -56,7 +172,11 @@ pub fn load() -> Vec<Endpoint> {
 fn save(list: &[Endpoint]) -> Result<(), String> {
     let path = store_path()?;
     let raw = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
-    std::fs::write(path, raw).map_err(|e| e.to_string())
+    write_private(&path, &raw).map_err(|e| e.to_string())
+}
+
+fn write_private(path: &std::path::Path, raw: &str) -> std::io::Result<()> {
+    paths::write_private(path, raw.as_bytes())
 }
 
 /// Add (or replace by name) an endpoint.
@@ -64,6 +184,13 @@ pub fn add(ep: Endpoint) -> Result<(), String> {
     if ep.name.trim().is_empty() || ep.url.trim().is_empty() {
         return Err("name and url are required".into());
     }
+    let ep = Endpoint {
+        name: ep.name.trim().to_string(),
+        url: normalize_base_url(&ep.url, ep.kind)?,
+        model: ep.model.trim().to_string(),
+        kind: ep.kind,
+        api_key: ep.api_key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()),
+    };
     let mut list = load();
     list.retain(|e| e.name != ep.name);
     list.push(ep);
@@ -95,7 +222,7 @@ pub fn guess_kind(url: &str) -> ApiKind {
 /// `GET /api/tags`. A cheap reachability + capability check that never runs
 /// inference, so adding a model can offer a pick-list and health can be tested.
 pub fn probe(url: &str, kind: ApiKind, api_key: Option<&str>) -> Result<Vec<String>, String> {
-    let base = url.trim_end_matches('/');
+    let base = normalize_base_url(url, kind)?;
     let (path, list_key, id_key) = match kind {
         ApiKind::Openai => ("/v1/models", "data", "id"),
         ApiKind::Ollama => ("/api/tags", "models", "name"),
@@ -133,10 +260,21 @@ pub fn host_of(url: &str) -> String {
 pub fn chat_openai<F: FnMut(&str) -> bool>(
     ep: &Endpoint,
     messages: &serde_json::Value,
+    on_token: F,
+) -> Result<(String, (u64, u64)), String> {
+    chat_openai_with_timeout(ep, messages, CHAT_TIMEOUT, on_token)
+}
+
+/// Like `chat_openai`, but lets mesh serving bind the upstream network request
+/// to the policy timeout so a silent endpoint cannot occupy a serving slot.
+pub fn chat_openai_with_timeout<F: FnMut(&str) -> bool>(
+    ep: &Endpoint,
+    messages: &serde_json::Value,
+    timeout: Duration,
     mut on_token: F,
 ) -> Result<(String, (u64, u64)), String> {
-    let url = format!("{}/v1/chat/completions", ep.url.trim_end_matches('/'));
-    let mut req = ureq::post(&url).set("Content-Type", "application/json");
+    let url = format!("{}/v1/chat/completions", normalize_base_url(&ep.url, ep.kind)?);
+    let mut req = ureq::post(&url).timeout(timeout).set("Content-Type", "application/json");
     if let Some(key) = ep.api_key.as_deref().filter(|k| !k.is_empty()) {
         req = req.set("Authorization", &format!("Bearer {key}"));
     }
@@ -149,7 +287,8 @@ pub fn chat_openai<F: FnMut(&str) -> bool>(
     let resp = match req.send_json(body) {
         Ok(r) => r,
         Err(ureq::Error::Status(code, r)) => {
-            let msg = r.into_string().unwrap_or_default();
+            let mut msg = String::new();
+            let _ = r.into_reader().take(MAX_ENDPOINT_ERROR_BODY).read_to_string(&mut msg);
             return Err(format!("endpoint returned {code}: {}", msg.trim()));
         }
         Err(e) => return Err(format!("cannot reach {url}: {e}")),
@@ -198,5 +337,71 @@ mod tests {
     fn host_of_strips_scheme_and_path() {
         assert_eq!(host_of("https://user--app.modal.run/v1"), "user--app.modal.run");
         assert_eq!(host_of("http://127.0.0.1:8000"), "127.0.0.1:8000");
+    }
+
+    #[test]
+    fn normalize_base_url_accepts_common_pasted_forms() {
+        assert_eq!(
+            normalize_base_url("https://api.example.com/v1", ApiKind::Openai).unwrap(),
+            "https://api.example.com"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.example.com/v1/chat/completions", ApiKind::Openai).unwrap(),
+            "https://api.example.com"
+        );
+        assert_eq!(
+            normalize_base_url("http://192.168.1.7:11434/api", ApiKind::Ollama).unwrap(),
+            "http://192.168.1.7:11434"
+        );
+        assert_eq!(
+            normalize_base_url("192.168.1.7:8000", ApiKind::Openai).unwrap(),
+            "http://192.168.1.7:8000"
+        );
+        assert_eq!(
+            normalize_base_url("[::1]:8000", ApiKind::Openai).unwrap(),
+            "http://[::1]:8000"
+        );
+        assert_eq!(
+            normalize_base_url("api.example.com", ApiKind::Openai).unwrap(),
+            "https://api.example.com"
+        );
+        assert_eq!(
+            normalize_base_url("lanbox:8000", ApiKind::Openai).unwrap(),
+            "http://lanbox:8000"
+        );
+        assert!(normalize_base_url("ftp://api.example.com", ApiKind::Openai).is_err());
+        assert!(normalize_base_url("https://user:pass@api.example.com/v1", ApiKind::Openai).is_err());
+        assert!(normalize_base_url("https://api.example.com/v1?key=secret", ApiKind::Openai).is_err());
+        assert!(normalize_base_url("https://api.example.com/v1#frag", ApiKind::Openai).is_err());
+    }
+
+    #[test]
+    fn aliases_include_name_and_model_once() {
+        let ep = Endpoint {
+            name: "zo".into(),
+            url: "https://zo.example".into(),
+            model: "meta-llama/Llama-3.1-8B-Instruct".into(),
+            kind: ApiKind::Openai,
+            api_key: None,
+        };
+        assert_eq!(aliases(&ep), vec!["zo", "meta-llama/Llama-3.1-8B-Instruct"]);
+
+        let ep = Endpoint { model: "zo".into(), ..ep };
+        assert_eq!(aliases(&ep), vec!["zo"]);
+    }
+
+    #[test]
+    fn matches_endpoint_by_friendly_name_or_exact_model_id() {
+        let ep = Endpoint {
+            name: "zo".into(),
+            url: "https://zo.example".into(),
+            model: "Meta/CaseSensitive".into(),
+            kind: ApiKind::Openai,
+            api_key: None,
+        };
+        assert!(matches_model(&ep, "zo"));
+        assert!(matches_model(&ep, "ZO"));
+        assert!(matches_model(&ep, "Meta/CaseSensitive"));
+        assert!(!matches_model(&ep, "meta/casesensitive"));
     }
 }

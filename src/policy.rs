@@ -31,11 +31,14 @@ pub struct EndpointPolicy {
     /// Disable the `/v1` bearer gate entirely. Only for trusted, loopback-only
     /// use — never with a `public_url` set.
     pub open: bool,
+    /// Advertise and broker registered hosted endpoints to mesh peers. Off by
+    /// default because those calls may spend provider API keys.
+    pub share_in_mesh: bool,
 }
 
 impl Default for EndpointPolicy {
     fn default() -> Self {
-        Self { public_url: String::new(), api_key: String::new(), open: false }
+        Self { public_url: String::new(), api_key: String::new(), open: false, share_in_mesh: false }
     }
 }
 
@@ -162,7 +165,18 @@ impl Policy {
         }
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| format!("read policy.toml: {e}"))?;
-        toml::from_str(&raw).map_err(|e| format!("invalid policy.toml: {e}"))
+        let policy: Policy = toml::from_str(&raw).map_err(|e| format!("invalid policy.toml: {e}"))?;
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let spec = self.availability.hours.trim();
+        if spec.eq_ignore_ascii_case("always") || spec.is_empty() || parse_window(spec).is_some() {
+            Ok(())
+        } else {
+            Err(format!("invalid availability.hours: {spec} (use `always` or `HH:MM-HH:MM`)"))
+        }
     }
 
     /// Is `now` (unix seconds, treated as UTC) within the serving window?
@@ -171,7 +185,7 @@ impl Policy {
         if spec.eq_ignore_ascii_case("always") || spec.is_empty() {
             return true;
         }
-        let Some((start, end)) = parse_window(spec) else { return true };
+        let Some((start, end)) = parse_window(spec) else { return false };
         let minute_of_day = ((now % 86_400) / 60) as u32;
         if start <= end {
             minute_of_day >= start && minute_of_day < end
@@ -269,7 +283,7 @@ pub fn evaluate(policy: &Policy, req: &AdmissionRequest, st: &AdmissionState) ->
     }
 
     // 5. Resource gate — concurrency then VRAM. These are "try later", not "no".
-    if st.concurrent_remote >= policy.serve.max_concurrent_remote {
+    if policy.serve.max_concurrent_remote > 0 && st.concurrent_remote >= policy.serve.max_concurrent_remote {
         return Admit::Queue(format!(
             "at concurrency limit ({}/{})",
             st.concurrent_remote, policy.serve.max_concurrent_remote
@@ -397,5 +411,13 @@ mod tests {
         p.availability.hours = "22:00-06:00".into();
         assert!(p.within_hours(3_600)); // 01:00
         assert!(!p.within_hours(43_200)); // 12:00
+    }
+
+    #[test]
+    fn invalid_hours_fail_closed() {
+        let mut p = Policy::default();
+        p.availability.hours = "9 to 5".into();
+        assert!(!p.within_hours(43_200));
+        assert!(p.validate().is_err());
     }
 }

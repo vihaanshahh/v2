@@ -76,12 +76,14 @@ v2 ps                                       # installed models with fit info
 `v2 serve` runs a metering proxy in front of Ollama and exposes an
 **OpenAI-compatible API**, so any OpenAI SDK/tool can point its Base URL at v2.
 The `/v1` surface is **key-gated by default** — v2 auto-creates and persists a
-key at `~/.v2/api_key` on first run, so it's safe to expose with zero setup.
+key at `~/.v2/api_key` on first run. For public internet use, put it behind a
+TLS tunnel or reverse proxy; the bearer key is generated for you.
 
 ```bash
-nohup v2 serve --listen 127.0.0.1:11435 --headless >/tmp/v2-serve.log 2>&1 &
+mkdir -p ~/.v2/logs && chmod 700 ~/.v2 ~/.v2/logs
+umask 077; nohup v2 serve --listen 127.0.0.1:11435 --headless >~/.v2/logs/serve.log 2>&1 &
 curl -s --retry 20 --retry-all-errors -o /dev/null http://127.0.0.1:11435/api/tags  # wait
-v2 endpoint                       # prints the paste-ready Base URL + key + models
+v2 endpoint                       # prints the paste-ready Base URL + full key + models
 ```
 
 Knobs — set in `~/.v2/policy.toml` (the natural, persistent way) **or** via env
@@ -90,8 +92,9 @@ Knobs — set in `~/.v2/policy.toml` (the natural, persistent way) **or** via en
 ```toml
 [endpoint]
 public_url = "https://your-host"   # advertised Base URL (clients get <url>/v1)
-# api_key  = ""                     # empty → auto key at ~/.v2/api_key
+# api_key  = ""                     # empty → auto 256-bit key at ~/.v2/api_key
 # open     = false                  # true → no bearer gate (loopback only)
+# share_in_mesh = false             # true → peers may spend registered endpoint keys
 ```
 
 Env equivalents: `V2_PUBLIC_URL`, `V2_API_KEY`, `V2_OPEN=1`.
@@ -115,8 +118,10 @@ curl -s http://127.0.0.1:11435/v1/chat/completions \
 ```
 
 **Unify remote models too.** Register any OpenAI-compatible host (Modal, vLLM,
-OpenAI, Together, …) and v2 will route requests for its model id to it (with its
-own key), so one Base URL fronts local + remote:
+OpenAI, Together, …) and v2 will route requests for its model id or friendly name
+to it (with its own key), so one Base URL fronts local + remote. Endpoint URLs
+are normalized, so `https://api.example.com/v1` and `https://api.example.com`
+are equivalent; remote Ollama `/api` roots are normalized the same way.
 
 ```bash
 # In the interactive panel (v2 serve without --headless) → "add endpoint",
@@ -125,8 +130,11 @@ own key), so one Base URL fronts local + remote:
 # Then: curl … -d '{"model":"gpt-5.5", …}' is proxied to OpenAI with that key.
 ```
 
-Without `V2_API_KEY`, `/v1` is open — fine for the default `127.0.0.1` bind, **not**
-for a network-exposed one. Non-`/v1` paths always pass through to Ollama.
+Without `V2_API_KEY`, v2 still creates and requires `~/.v2/api_key`. `/v1` is
+open only when `V2_OPEN=1` or `endpoint.open=true` is set on loopback with no
+public URL. On network-exposed binds, or when `V2_PUBLIC_URL` / `public_url` is
+set, all proxy paths require the same bearer key. `v2 serve` redacts the key in
+logs; use `v2 endpoint` when you need the full value.
 
 ## 6. Mesh — pool compute across machines
 
@@ -134,7 +142,7 @@ for a network-exposed one. Non-`/v1` paths always pass through to Ollama.
 
 ```bash
 v2 mesh init                                  # create the org; you are the admin
-nohup v2 serve --mesh-listen 0.0.0.0:4830 --headless >/tmp/v2-mesh.log 2>&1 &
+umask 077; nohup v2 serve --mesh-listen 0.0.0.0:4830 --headless >~/.v2/logs/mesh.log 2>&1 &
 v2 mesh invite YOUR_HOST:4830                 # print a one-time invite ticket
 ```
 
@@ -160,10 +168,10 @@ end-to-end through it).
 
 ```bash
 # On a small always-reachable box (VPS): run the relay
-nohup v2 mesh relay --listen 0.0.0.0:4840 >/tmp/v2-relay.log 2>&1 &
+umask 077; nohup v2 mesh relay --listen 0.0.0.0:4840 >~/.v2/logs/relay.log 2>&1 &
 
 # On the serving node: register through the relay instead of opening a port
-nohup v2 serve --relay RELAY_HOST:4840 --headless >/tmp/v2-serve.log 2>&1 &
+umask 077; nohup v2 serve --relay RELAY_HOST:4840 --headless >~/.v2/logs/serve.log 2>&1 &
 
 # Admin: mint an invite that hides your IP (embeds relay://…/<your-node-id>)
 v2 mesh invite --via-relay RELAY_HOST:4840

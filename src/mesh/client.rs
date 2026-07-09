@@ -5,7 +5,7 @@ use colored::Colorize;
 
 use crate::hardware::HardwareInfo;
 
-use super::gossip::{NodeCard, PeersFile};
+use super::gossip::{NodeCard, PeerEntry, PeersFile};
 use super::identity::{EnrollTicket, MeshIdentity, NodeKey, OrgRoot, RevocationList};
 use super::proto::{CoSign, EnrollResponse, Frame, Receipt, Request};
 use super::transport::{self, Peer};
@@ -105,7 +105,7 @@ pub fn join(ticket_str: &str) -> Result<(), String> {
     let addr = ticket.addr.clone();
     let revs = RevocationList::load();
 
-    let (mut ch, _peer) = transport::connect_enroll(&addr, &node, ticket, &org_pub, &revs)?;
+    let (mut ch, peer) = transport::connect_enroll(&addr, &node, ticket, &org_pub, &revs)?;
     let resp: EnrollResponse = ch.recv_json().map_err(|e| format!("enrollment failed: {e}"))?;
 
     // The issued cert must be for us and signed by the org in the ticket.
@@ -120,7 +120,7 @@ pub fn join(ticket_str: &str) -> Result<(), String> {
 
     MeshIdentity { org_pub: resp.org_pub, cert: resp.cert }.save()?;
     let mut peers = PeersFile::load();
-    peers.add(&addr);
+    peers.add_with_node(&addr, peer.node_pub());
     peers.save()?;
 
     println!("{}", "joined the mesh".green());
@@ -135,8 +135,14 @@ pub fn join(ticket_str: &str) -> Result<(), String> {
 pub fn status() -> Result<(), String> {
     let node = NodeKey::load_or_create()?;
     let peers = PeersFile::load();
+    let ident = MeshIdentity::load()?;
+    let connected = if ident.is_some() && !peers.peers.is_empty() {
+        collect_cards_with_logging(false).map(|cards| cards.len()).unwrap_or(0)
+    } else {
+        0
+    };
     let mut rows = vec![("node".to_string(), short_id(&node.public_b64()))];
-    match MeshIdentity::load()? {
+    match ident {
         None => rows.push((
             "member".into(),
             format!("{}  — run `v2 mesh init` or `v2 mesh join`", "no".yellow()),
@@ -149,7 +155,10 @@ pub fn status() -> Result<(), String> {
             rows.push(("cert".into(), format!("valid {remaining}h")));
         }
     }
-    rows.push(("peers".into(), peers.peers.len().to_string()));
+    rows.push((
+        "peers".into(),
+        format!("{connected} connected / {} known", peers.peers.len()),
+    ));
     crate::ui::panel("mesh status", &rows);
     for p in peers.peers {
         println!("  · {}", p.addr.dimmed());
@@ -174,6 +183,7 @@ pub fn peers() -> Result<(), String> {
     }
     crate::ui::section(&format!("mesh peers  ({} reachable)", cards.len()));
     for (addr, card) in &cards {
+        let model_count = card.models.len() + card.remote_models.len();
         println!(
             "  {:<22} {:<10} {:>5.0}G  {:>4.0} GB/s  {}/{} busy  {} models",
             addr,
@@ -182,13 +192,26 @@ pub fn peers() -> Result<(), String> {
             card.bandwidth_gbps,
             card.concurrent,
             card.max_concurrent,
-            card.models.len(),
+            model_count,
         );
+        if !card.remote_models.is_empty() {
+            let remote = card
+                .remote_models
+                .iter()
+                .map(|m| format!("{}@{}", m.name, m.host))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("  {:<22} {}", "", remote.dimmed());
+        }
     }
     Ok(())
 }
 
 fn collect_cards() -> Result<Vec<(String, NodeCard)>, String> {
+    collect_cards_with_logging(true)
+}
+
+fn collect_cards_with_logging(log_unreachable: bool) -> Result<Vec<(String, NodeCard)>, String> {
     let node = NodeKey::load_or_create()?;
     let ident = MeshIdentity::load()?.ok_or("not a mesh member")?;
     let org_pub = ident.org_pub_bytes()?;
@@ -198,17 +221,52 @@ fn collect_cards() -> Result<Vec<(String, NodeCard)>, String> {
     let mut out = vec![];
     for p in peers.peers {
         match transport::connect_member(&p.addr, &node, ident.cert.clone(), &org_pub, &revs) {
-            Ok((mut ch, _)) => {
+            Ok((mut ch, peer)) => {
+                if let Err(e) = check_peer_pin(&p, peer.node_pub()) {
+                    if log_unreachable {
+                        eprintln!("  {} rejected: {}", p.addr, e);
+                    }
+                    continue;
+                }
+                remember_peer_node(&p.addr, peer.node_pub());
                 if ch.send_json(&Request::Card).is_ok() {
                     if let Ok(Frame::Card { card }) = ch.recv_json::<Frame>() {
                         out.push((p.addr.clone(), card));
                     }
                 }
             }
-            Err(e) => eprintln!("  {} unreachable: {}", p.addr, e),
+            Err(e) if log_unreachable => eprintln!("  {} unreachable: {}", p.addr, e),
+            Err(_) => {}
         }
     }
     Ok(out)
+}
+
+fn check_peer_pin(entry: &PeerEntry, node_pub: &str) -> Result<(), String> {
+    if let Some(pin) = entry.node_pub.as_deref() {
+        if pin != node_pub {
+            return Err(format!("peer identity changed: expected {}, got {}", short_id(pin), short_id(node_pub)));
+        }
+    }
+    Ok(())
+}
+
+fn remember_peer_node(addr: &str, node_pub: &str) {
+    let mut peers = PeersFile::load();
+    let changed = match peers.peers.iter_mut().find(|p| p.addr == addr) {
+        Some(p) if p.node_pub.is_none() => {
+            p.node_pub = Some(node_pub.to_string());
+            true
+        }
+        Some(_) => false,
+        None => {
+            peers.add_with_node(addr, node_pub);
+            true
+        }
+    };
+    if changed {
+        let _ = peers.save();
+    }
 }
 
 /// Read every stored receipt, verify both signatures, and reconcile totals.
@@ -360,6 +418,10 @@ fn try_peer(
         Peer::Member { node_pub, .. } => node_pub.clone(),
         _ => return Err("peer is not a member".into()),
     };
+    if let Some(entry) = PeersFile::load().peers.into_iter().find(|p| p.addr == addr) {
+        check_peer_pin(&entry, &server_pub)?;
+    }
+    remember_peer_node(addr, &server_pub);
 
     ch.send_json(&Request::Chat { model: model.to_string(), ctx, messages: messages.clone() })
         .map_err(|e| e.to_string())?;
@@ -382,11 +444,11 @@ fn try_peer(
                 println!();
                 return Err(reason);
             }
-            Frame::Done { tokens_out, duration_ms, receipt, .. } => {
+            Frame::Done { tokens_in, tokens_out, duration_ms, receipt } => {
                 println!();
                 let tps = if duration_ms > 0 { tokens_out as f64 / (duration_ms as f64 / 1000.0) } else { 0.0 };
                 println!("{}", format!("  {tokens_out} tok · {tps:.0} tok/s · {}", short_id(&server_pub)).dimmed());
-                cosign_and_store(node, &mut ch, receipt);
+                cosign_and_store(node, &mut ch, receipt, &server_pub, model, tokens_in, tokens_out)?;
                 return Ok(true);
             }
             _ => {}
@@ -394,7 +456,16 @@ fn try_peer(
     }
 }
 
-fn cosign_and_store(node: &NodeKey, ch: &mut super::transport::Channel, mut receipt: Receipt) {
+fn cosign_and_store(
+    node: &NodeKey,
+    ch: &mut super::transport::Channel,
+    mut receipt: Receipt,
+    server_pub: &str,
+    model: &str,
+    tokens_in: u64,
+    tokens_out: u64,
+) -> Result<(), String> {
+    validate_receipt(node, &receipt, server_pub, model, tokens_in, tokens_out)?;
     // Co-sign the receipt so both sides hold a tamper-evident record (H5).
     let sig = b64(&node.sign(&receipt.signing_bytes()));
     receipt.client_sig = sig.clone();
@@ -402,7 +473,7 @@ fn cosign_and_store(node: &NodeKey, ch: &mut super::transport::Channel, mut rece
     if let Ok(dir) = crate::paths::subdir("mesh/receipts") {
         let name = format!("{}-used-{}.json", receipt.ts, short_id(&receipt.server_pub));
         if let Ok(raw) = serde_json::to_string_pretty(&receipt) {
-            let _ = std::fs::write(dir.join(name), raw);
+            let _ = crate::paths::write_private(&dir.join(name), raw.as_bytes());
         }
     }
     // Record what we consumed elsewhere.
@@ -415,4 +486,31 @@ fn cosign_and_store(node: &NodeKey, ch: &mut super::transport::Channel, mut rece
         tokens_out: receipt.tokens_out,
         duration_ms: 0,
     });
+    Ok(())
+}
+
+fn validate_receipt(
+    node: &NodeKey,
+    receipt: &Receipt,
+    server_pub: &str,
+    model: &str,
+    tokens_in: u64,
+    tokens_out: u64,
+) -> Result<(), String> {
+    if receipt.server_pub != server_pub {
+        return Err("receipt server does not match authenticated peer".into());
+    }
+    if receipt.client_pub != node.public_b64() {
+        return Err("receipt client does not match this node".into());
+    }
+    if receipt.model != model {
+        return Err("receipt model does not match request".into());
+    }
+    if receipt.tokens_in != tokens_in || receipt.tokens_out != tokens_out {
+        return Err("receipt token counts do not match completion frame".into());
+    }
+    if !receipt.verify().0 {
+        return Err("receipt server signature invalid".into());
+    }
+    Ok(())
 }

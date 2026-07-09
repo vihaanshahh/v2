@@ -2,25 +2,27 @@
 
 ## File layout — `~/.v2/`
 
-Everything v2 writes lives under `~/.v2/`:
+Everything v2 writes lives under `~/.v2/` (directories are kept `0700` on Unix):
 
 ```
 ~/.v2/
   key                     node identity (ed25519 seed, mode 0600)
+  api_key                 OpenAI-compatible /v1 bearer key (mode 0600)
+  endpoints.json          registered hosted/remote endpoints + optional keys (mode 0600)
   policy.toml             serving policy (optional)
-  usage/day-<n>.jsonl     append-only metering log (one line per request)
+  usage/day-<n>.jsonl     append-only metering log (one line per request, mode 0600)
   mesh/
     org_root.key          org signing key — admin only, mode 0600
-    org.json              trusted org pubkey + this node's membership cert
-    revoked.json          revocation list
-    peers.json            known peer addresses
-    federation.json       federated orgs and their scopes
-    used_nonces.json      spent invite-ticket nonces (admin)
-    receipts/             signed usage receipts
+    org.json              trusted org pubkey + this node's membership cert (mode 0600)
+    revoked.json          revocation list (mode 0600)
+    peers.json            known peer addresses + pinned node ids (mode 0600)
+    federation.json       federated orgs and their scopes (mode 0600)
+    used_nonces.json      spent invite-ticket nonces (admin, mode 0600)
+    receipts/             signed usage receipts (files mode 0600)
 ```
 
-Delete `~/.v2` to reset all state. The identity and org-root keys are secrets —
-they're written with `0600` permissions on Unix.
+Delete `~/.v2` to reset all state. The identity, org-root, API, endpoint, peer,
+and receipt files are private on Unix.
 
 ## Environment variables
 
@@ -28,6 +30,9 @@ they're written with `0600` permissions on Unix.
 |----------|---------|
 | `OLLAMA_HOST` | Ollama base URL (default `http://127.0.0.1:11434`) |
 | `V2_ACCEPTED` | path to an enterprise allowlist file |
+| `V2_PUBLIC_URL` | public/tunnel URL advertised by `v2 endpoint` |
+| `V2_API_KEY` | explicit bearer token for the `/v1` OpenAI-compatible surface |
+| `V2_OPEN` | `1`/`true` disables `/v1` auth only on loopback with no public URL |
 | `COLUMNS` | overrides detected terminal width for the UI |
 
 ## `policy.toml`
@@ -81,7 +86,24 @@ global_tokens_per_hour = 2_000_000
 # Hard control by node id (base64), beyond revocation:
 deny_nodes = []       # always refused
 only_nodes = []       # if non-empty, ONLY these nodes may be served
+
+[endpoint]
+# Public/tunnel base URL to advertise. `/v1` is appended for clients; if you
+# include `/v1` here it is normalized away.
+public_url = ""
+# Empty = auto-create a 256-bit bearer key at ~/.v2/api_key.
+api_key = ""
+# Disable the bearer gate entirely. Only safe for trusted loopback-only use.
+open = false
+# Advertise and broker registered hosted endpoints to mesh peers. Off by
+# default because those calls may spend provider API keys.
+share_in_mesh = false
 ```
+
+When `public_url` / `V2_PUBLIC_URL` is set, or `serve --listen` binds a
+non-loopback address, all proxy paths require the bearer key. `open = true` /
+`V2_OPEN=1` is refused in those modes. Availability `hours` must be `always` or
+`HH:MM-HH:MM`; malformed values make serving fail closed.
 
 ### Abuse-control layers
 

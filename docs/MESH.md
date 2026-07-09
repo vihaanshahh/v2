@@ -5,6 +5,12 @@ identity; membership is an org-signed certificate; the wire is an encrypted,
 mutually-authenticated channel. Ollama itself is never exposed — peers only ever
 talk to v2, which enforces policy in front of it.
 
+Nodes can also broker registered hosted endpoints (Modal, vLLM, TGI, remote
+Ollama, etc.) into the same mesh, but only when the owner opts in with
+`endpoint.share_in_mesh = true`. That switch matters because peers can spend the
+provider API key saved with the endpoint. After opting in, peers can address it by
+the friendly endpoint name or its model id with `v2 mesh run`.
+
 ## Roles
 
 - **Admin** — holds the org root key, invites and revokes members.
@@ -31,6 +37,7 @@ member, also serves the mesh.
 ```bash
 v2 mesh join <ticket>              # the whole member setup
 v2 mesh run qwen3:32b "explain quicksort"
+v2 mesh run zo "use the hosted endpoint named zo"  # if that owner enabled share_in_mesh
 ```
 
 `join` connects to the admin over an encrypted channel, proves control of your node

@@ -9,10 +9,11 @@ use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::activity::Activity;
 use crate::engine;
+use crate::endpoints::{self, ApiKind};
 use crate::hardware::HardwareInfo;
 use crate::ollama;
 use crate::ollama_api;
@@ -59,6 +60,53 @@ impl Drop for Slot {
         self.concurrent.fetch_sub(1, Ordering::SeqCst);
         self.used_vram_milli.fetch_sub(self.milli, Ordering::SeqCst);
     }
+}
+
+fn reserve_slot(ctx: &ServeCtx, projected: f64) -> Result<Slot, String> {
+    let max_concurrent = ctx.policy.serve.max_concurrent_remote;
+    if max_concurrent == 0 {
+        ctx.concurrent.fetch_add(1, Ordering::SeqCst);
+    } else {
+        loop {
+            let cur = ctx.concurrent.load(Ordering::SeqCst);
+            if cur >= max_concurrent {
+                return Err(format!("at concurrency limit ({cur}/{max_concurrent})"));
+            }
+            if ctx.concurrent
+                .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    let milli = (projected.clamp(0.0, 1.0) * 1000.0) as u32;
+    let max_milli = (ctx.policy.serve.max_vram_fraction.max(0.0) * 1000.0) as u32;
+    loop {
+        let used = ctx.used_vram_milli.load(Ordering::SeqCst);
+        if used.saturating_add(milli) > max_milli {
+            ctx.concurrent.fetch_sub(1, Ordering::SeqCst);
+            return Err(format!(
+                "would exceed VRAM budget ({:.0}% + {:.0}% > {:.0}%)",
+                used as f64 / 10.0,
+                milli as f64 / 10.0,
+                max_milli as f64 / 10.0
+            ));
+        }
+        if ctx.used_vram_milli
+            .compare_exchange(used, used + milli, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            break;
+        }
+    }
+
+    Ok(Slot {
+        concurrent: ctx.concurrent.clone(),
+        used_vram_milli: ctx.used_vram_milli.clone(),
+        milli,
+    })
 }
 
 /// Bind and serve the mesh port until the process stops. Blocks.
@@ -189,7 +237,14 @@ fn serve_chat(
     }
 
     // ── H1: admission ────────────────────────────────────────────────────────
-    let projected = vram_fraction(&ctx.hw, model, cctx);
+    let endpoint_match = endpoints::find_model(model);
+    if endpoint_match.is_some() && !ctx.policy.endpoint.share_in_mesh {
+        return ch
+            .send_json(&Frame::Refused { reason: "hosted endpoint sharing is disabled by policy".into() })
+            .map_err(|e| e.to_string());
+    }
+    let endpoint = endpoint_match;
+    let projected = if endpoint.is_some() { 0.0 } else { vram_fraction(&ctx.hw, model, cctx) };
     let state = AdmissionState {
         concurrent_remote: ctx.concurrent.load(Ordering::SeqCst),
         used_vram_fraction: ctx.used_vram_milli.load(Ordering::SeqCst) as f64 / 1000.0,
@@ -212,14 +267,12 @@ fn serve_chat(
         Admit::Ok => {}
     }
 
-    // Reserve resources (released on any return via Drop).
-    let milli = (projected * 1000.0) as u32;
-    ctx.concurrent.fetch_add(1, Ordering::SeqCst);
-    ctx.used_vram_milli.fetch_add(milli, Ordering::SeqCst);
-    let _slot = Slot {
-        concurrent: ctx.concurrent.clone(),
-        used_vram_milli: ctx.used_vram_milli.clone(),
-        milli,
+    // Reserve resources atomically (released on any return via Drop). This
+    // closes the race where several parallel requests could all pass evaluate()
+    // before any of them incremented the counters.
+    let _slot = match reserve_slot(ctx, projected) {
+        Ok(slot) => slot,
+        Err(reason) => return ch.send_json(&Frame::Queued { reason }).map_err(|e| e.to_string()),
     };
 
     ch.send_json(&Frame::Accepted).map_err(|e| e.to_string())?;
@@ -229,43 +282,45 @@ fn serve_chat(
     let paused = ctx.paused.clone();
     let activity = ctx.activity.clone();
     let cooldown = ctx.policy.availability.local_cooldown_s;
-    let timeout = std::time::Duration::from_secs(ctx.policy.serve.request_timeout_s.max(1));
+    let timeout = Duration::from_secs(ctx.policy.serve.request_timeout_s.max(1));
 
     let mut abort: Option<String> = None;
-    let stream_res = {
+    let stream_res: Result<(String, (u64, u64)), String> = {
         let ch_ref = &mut *ch;
-        ollama_api::chat_stream(&ctx.ollama_host, model, messages, |tok| {
-            if start.elapsed() > timeout {
-                abort = Some("preempted: request timeout".into());
-                return false;
-            }
-            if paused.load(Ordering::SeqCst) {
-                abort = Some("preempted: node paused".into());
-                return false;
-            }
-            if activity.owner_active(cooldown) {
-                abort = Some("preempted: owner active".into());
-                return false;
-            }
-            // Deadman: if the client is gone this send fails and we abort,
-            // which drops the Ollama connection and stops generation.
-            if ch_ref.send_json(&Frame::Token { c: tok.to_string() }).is_err() {
-                abort = Some("client disconnected".into());
-                return false;
-            }
-            true
-        })
+        match endpoint.as_ref() {
+            Some(ep) => match ep.kind {
+                ApiKind::Openai => endpoints::chat_openai_with_timeout(ep, messages, timeout, |tok| {
+                    forward_token(ch_ref, &paused, &activity, cooldown, start, timeout, &mut abort, tok)
+                }),
+                ApiKind::Ollama => endpoints::normalize_base_url(&ep.url, ep.kind)
+                    .and_then(|url| {
+                        ollama_api::chat_stream(&url, &ep.model, messages, |tok| {
+                            forward_token(ch_ref, &paused, &activity, cooldown, start, timeout, &mut abort, tok)
+                        })
+                    })
+                    .map(|(reply, stats)| (reply, (stats.prompt_eval_count, stats.eval_count))),
+            },
+            None => ollama_api::chat_stream(&ctx.ollama_host, model, messages, |tok| {
+                forward_token(ch_ref, &paused, &activity, cooldown, start, timeout, &mut abort, tok)
+            })
+            .map(|(reply, stats)| (reply, (stats.prompt_eval_count, stats.eval_count))),
+        }
     };
 
     let (tokens_in, tokens_out) = match &stream_res {
-        Ok((_full, stats)) => (stats.prompt_eval_count, stats.eval_count),
+        Ok((reply, (tokens_in, tokens_out))) if endpoint.is_some() => {
+            let tokens_in = if *tokens_in == 0 { estimate_message_tokens(messages) } else { *tokens_in };
+            let tokens_out = if *tokens_out == 0 { estimate_text_tokens(reply) } else { *tokens_out };
+            (tokens_in, tokens_out)
+        }
+        Ok((_full, (tokens_in, tokens_out))) => (*tokens_in, *tokens_out),
         Err(_) => (0, 0),
     };
     let duration_ms = start.elapsed().as_millis() as u64;
 
     // Record what we served regardless of outcome (partial usage still counts).
     record_served(ctx, peer_pub, model, tokens_in, tokens_out, duration_ms);
-    ctx.abuse.record_tokens(tokens_out, now_unix());
+    ctx.abuse.record_tokens(tokens_in.saturating_add(tokens_out), now_unix());
 
     if let Some(reason) = abort {
         return ch.send_json(&Frame::Error { reason }).map_err(|e| e.to_string());
@@ -298,6 +353,38 @@ fn serve_chat(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn forward_token(
+    ch: &mut Channel,
+    paused: &AtomicBool,
+    activity: &Activity,
+    cooldown: u64,
+    start: Instant,
+    timeout: Duration,
+    abort: &mut Option<String>,
+    tok: &str,
+) -> bool {
+    if start.elapsed() > timeout {
+        *abort = Some("preempted: request timeout".into());
+        return false;
+    }
+    if paused.load(Ordering::SeqCst) {
+        *abort = Some("preempted: node paused".into());
+        return false;
+    }
+    if activity.owner_active(cooldown) {
+        *abort = Some("preempted: owner active".into());
+        return false;
+    }
+    // Deadman: if the client is gone this send fails and we abort, which drops
+    // the upstream connection and stops generation.
+    if ch.send_json(&Frame::Token { c: tok.to_string() }).is_err() {
+        *abort = Some("client disconnected".into());
+        return false;
+    }
+    true
+}
+
 fn handle_enroll(ctx: &ServeCtx, ch: &mut Channel, node_pub: &str, ticket: &super::identity::EnrollTicket) -> Result<(), String> {
     let org_root = ctx.org_root.as_ref().ok_or("this node cannot enroll members (not the admin)")?;
 
@@ -309,7 +396,10 @@ fn handle_enroll(ctx: &ServeCtx, ch: &mut Channel, node_pub: &str, ticket: &supe
             return Err("enrollment ticket already used".into());
         }
         used.insert(ticket.nonce.clone());
-        save_nonces(&used);
+        if let Err(e) = save_nonces(&used) {
+            used.remove(&ticket.nonce);
+            return Err(format!("cannot persist enrollment nonce: {e}"));
+        }
     }
 
     let node_bytes = unb64_arr::<32>(node_pub)?;
@@ -328,13 +418,25 @@ fn build_card(ctx: &ServeCtx) -> NodeCard {
         .into_iter()
         .filter_map(|m| m.ollama_name)
         .collect();
-    gossip::local_card(
+    let mut card = gossip::local_card(
         &ctx.node.public_b64(),
         &ctx.hw,
         &installed,
         ctx.concurrent.load(Ordering::SeqCst),
         ctx.policy.serve.max_concurrent_remote,
-    )
+    );
+    if ctx.policy.endpoint.share_in_mesh {
+        card.remote_models = endpoints::load()
+            .into_iter()
+            .map(|ep| gossip::RemoteModel {
+                name: ep.name,
+                model: ep.model,
+                kind: endpoints::kind_label(ep.kind).into(),
+                host: endpoints::host_of(&ep.url),
+            })
+            .collect();
+    }
+    card
 }
 
 /// Estimate a job's VRAM as a fraction of this node's total memory pool.
@@ -376,13 +478,30 @@ fn peer_tokens_last_hour(ctx: &ServeCtx, peer_pub: &str) -> u64 {
     }
 }
 
-fn record_served(ctx: &ServeCtx, peer_pub: &str, model: &str, tokens_in: u64, tokens_out: u64, duration_ms: u64) {
-    if tokens_in == 0 && tokens_out == 0 {
-        return;
+fn estimate_message_tokens(messages: &serde_json::Value) -> u64 {
+    match messages {
+        serde_json::Value::String(s) => estimate_text_tokens(s),
+        serde_json::Value::Array(items) => items.iter().map(estimate_message_tokens).sum(),
+        serde_json::Value::Object(map) => map
+            .values()
+            .map(|v| match v {
+                serde_json::Value::String(s) => estimate_text_tokens(s),
+                other => estimate_message_tokens(other),
+            })
+            .sum(),
+        _ => 0,
     }
+}
+
+fn estimate_text_tokens(text: &str) -> u64 {
+    ((text.chars().count() as u64).saturating_add(3) / 4).max(1)
+}
+
+fn record_served(ctx: &ServeCtx, peer_pub: &str, model: &str, tokens_in: u64, tokens_out: u64, duration_ms: u64) {
     let now = now_unix();
+    let total = tokens_in.saturating_add(tokens_out);
     if let Ok(mut q) = ctx.quota.lock() {
-        q.entry(peer_pub.to_string()).or_default().push((now, tokens_out));
+        q.entry(peer_pub.to_string()).or_default().push((now, total));
     }
     usage::append(&UsageRecord {
         ts: now,
@@ -399,16 +518,15 @@ fn store_receipt(receipt: &Receipt) {
     let Ok(dir) = crate::paths::subdir("mesh/receipts") else { return };
     let name = format!("{}-{}.json", receipt.ts, short_id(&receipt.client_pub));
     if let Ok(raw) = serde_json::to_string_pretty(receipt) {
-        let _ = std::fs::write(dir.join(name), raw);
+        let _ = crate::paths::write_private(&dir.join(name), raw.as_bytes());
     }
 }
 
-fn save_nonces(used: &HashSet<String>) {
-    let Ok(dir) = crate::paths::subdir("mesh") else { return };
+fn save_nonces(used: &HashSet<String>) -> Result<(), String> {
+    let dir = crate::paths::subdir("mesh").map_err(|e| e.to_string())?;
     let list: Vec<&String> = used.iter().collect();
-    if let Ok(raw) = serde_json::to_string(&list) {
-        let _ = std::fs::write(dir.join("used_nonces.json"), raw);
-    }
+    let raw = serde_json::to_string(&list).map_err(|e| e.to_string())?;
+    crate::paths::write_private(&dir.join("used_nonces.json"), raw.as_bytes()).map_err(|e| e.to_string())
 }
 
 pub fn load_nonces() -> HashSet<String> {

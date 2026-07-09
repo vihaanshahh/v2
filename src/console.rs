@@ -81,7 +81,7 @@ pub fn run(
             "" | "g" | "refresh" => {} // redraw
             "q" | "quit" | "exit" => break,
             "p" | "find" | "pull" => pull_flow(host, hw, ctx, arg),
-            "a" | "add" => add_endpoint_flow(),
+            "a" | "add" => add_endpoint_flow(host),
             "s" | "share" => share_menu(mesh_listen),
             "l" | "c" | "limit" | "cpu" => set_cpu_flow(arg, cpu, cores),
             other => match other.parse::<usize>() {
@@ -371,15 +371,25 @@ fn pull_flow(host: &str, hw: &HardwareInfo, ctx: u32, arg: &str) {
 
 /// `a` — register a hosted model (e.g. a Modal endpoint). Paste the URL and v2
 /// probes it, lists the models it serves, and lets you pick one.
-fn add_endpoint_flow() {
+fn add_endpoint_flow(host: &str) {
     println!("\n  {}", "add a hosted model".bold());
     println!("  {}", "point v2 at any OpenAI-compatible endpoint (Modal, vLLM, TGI, …) or a remote Ollama.".dimmed());
-    let url = prompt_line("  endpoint url (e.g. https://you--app.modal.run): ");
-    if url.is_empty() {
+    let raw_url = prompt_line("  endpoint url (e.g. https://you--app.modal.run): ");
+    if raw_url.is_empty() {
         return;
     }
-    let kind = endpoints::guess_kind(&url);
-    let key = prompt_line("  api key (optional, blank for none): ");
+    let kind = endpoints::guess_kind(&raw_url);
+    let url = match endpoints::normalize_base_url(&raw_url, kind) {
+        Ok(url) => url,
+        Err(e) => {
+            warn(&e);
+            return;
+        }
+    };
+    if url != raw_url.trim().trim_end_matches('/') {
+        println!("  {} {}", "normalized".dimmed(), url.dimmed());
+    }
+    let key = prompt_secret("  api key (optional, blank for none): ");
     let api_key = if key.is_empty() { None } else { Some(key) };
 
     // Probe once so we can offer a pick-list and confirm reachability up front.
@@ -405,11 +415,45 @@ fn add_endpoint_flow() {
     if name.is_empty() {
         name = model.clone();
     }
+    if let Some(reason) = endpoint_alias_collision(host, &name, &model) {
+        warn(&reason);
+        return;
+    }
     let ep = Endpoint { name: name.clone(), url, model, kind, api_key };
     match endpoints::add(ep) {
         Ok(()) => println!("  {}", format!("added {name} — open it from the list to chat.").green()),
         Err(e) => warn(&e),
     }
+}
+
+fn endpoint_alias_collision(host: &str, name: &str, model: &str) -> Option<String> {
+    let aliases = endpoints::aliases(&Endpoint {
+        name: name.to_string(),
+        url: "http://localhost".into(),
+        model: model.to_string(),
+        kind: endpoints::ApiKind::Openai,
+        api_key: None,
+    });
+    for ep in endpoints::load() {
+        if ep.name == name {
+            continue;
+        }
+        for alias in &aliases {
+            if endpoints::matches_model(&ep, alias) {
+                return Some(format!("endpoint alias `{alias}` already belongs to `{}`", ep.name));
+            }
+        }
+    }
+    let local = ollama::fetch_local(host).unwrap_or_default();
+    for tag in local.into_iter().filter_map(|m| m.ollama_name) {
+        for alias in &aliases {
+            let bare = tag.split(':').next().unwrap_or(&tag);
+            if tag == *alias || bare == alias || norm_tag(alias) == tag {
+                return Some(format!("endpoint alias `{alias}` collides with local Ollama model `{tag}`"));
+            }
+        }
+    }
+    None
 }
 
 /// Present the endpoint's models as a numbered pick-list (or accept a typed id).
@@ -462,11 +506,12 @@ fn remote_chat(ep: &Endpoint) {
                 true
             }),
             // A remote Ollama speaks the same streaming API as the local one.
-            endpoints::ApiKind::Ollama => ollama_api::chat_stream(&ep.url, &ep.model, &serde_json::Value::Array(messages.clone()), |tok| {
+            endpoints::ApiKind::Ollama => endpoints::normalize_base_url(&ep.url, ep.kind)
+                .and_then(|url| ollama_api::chat_stream(&url, &ep.model, &serde_json::Value::Array(messages.clone()), |tok| {
                 print!("{tok}");
                 io::stdout().flush().ok();
                 true
-            })
+            }))
             .map(|(reply, stats)| (reply, (stats.prompt_eval_count, stats.eval_count))),
         };
         println!();
@@ -639,7 +684,12 @@ fn share_state() -> String {
     match identity::MeshIdentity::load() {
         Ok(Some(ident)) => {
             let role = if identity::OrgRoot::load().is_ok() { "admin" } else { "member" };
-            format!("shared · {role} of org {}", mesh::short_id(&ident.org_pub))
+            let known = mesh::gossip::PeersFile::load().peers.len();
+            format!(
+                "shared · {role} of org {} · {known} peer{} known",
+                mesh::short_id(&ident.org_pub),
+                if known == 1 { "" } else { "s" },
+            )
         }
         _ => "private · press s to share".to_string(),
     }
@@ -740,6 +790,29 @@ fn prompt(p: &str) -> Option<String> {
 /// Like `prompt` but trims and treats EOF as an empty answer (caller aborts).
 fn prompt_line(p: &str) -> String {
     prompt(p).map(|s| s.trim().to_string()).unwrap_or_default()
+}
+
+fn prompt_secret(p: &str) -> String {
+    print!("{p}");
+    io::stdout().flush().ok();
+    set_echo(false);
+    let mut s = String::new();
+    let _ = io::stdin().read_line(&mut s);
+    set_echo(true);
+    println!();
+    s.trim().to_string()
+}
+
+fn set_echo(on: bool) {
+    #[cfg(unix)]
+    {
+        let arg = if on { "echo" } else { "-echo" };
+        let _ = Command::new("stty").arg(arg).status();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = on;
+    }
 }
 
 fn confirm(question: &str) -> bool {
