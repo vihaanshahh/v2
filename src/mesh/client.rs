@@ -27,11 +27,25 @@ pub fn init() -> Result<(), String> {
     Ok(())
 }
 
-pub fn invite(addr: &str, ttl_secs: u64) -> Result<(), String> {
+pub fn invite(addr: Option<&str>, via_relay: Option<&str>, ttl_secs: u64) -> Result<(), String> {
     let org = OrgRoot::load()?;
-    let ticket = org.make_ticket(addr, ttl_secs)?;
+    // A relay route hides your IP: the ticket carries relay://<relay>/<node-id>
+    // instead of a raw address. Requires this node to be registered at that relay
+    // (run `v2 serve --relay <relay>`).
+    let target = match (via_relay, addr) {
+        (Some(relay), _) => {
+            let node = NodeKey::load_or_create()?;
+            super::relay::make_route(relay, &node.public_b64())
+        }
+        (None, Some(a)) => a.to_string(),
+        (None, None) => return Err("provide an address or --via-relay <relay-addr>".into()),
+    };
+    let ticket = org.make_ticket(&target, ttl_secs)?;
     println!("{}", "one-time invite ticket (expires in {}h):".replace("{}", &(ttl_secs / 3600).to_string()));
     println!("\n{}\n", ticket.encode());
+    if via_relay.is_some() {
+        println!("Reachable via relay (your IP stays hidden). Keep `v2 serve --relay …` running.");
+    }
     println!("Recipient runs:  v2 mesh join <ticket>");
     Ok(())
 }

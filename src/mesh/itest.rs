@@ -197,8 +197,8 @@ fn mesh_end_to_end() {
     .unwrap();
 
     let mut text = String::new();
-    let mut tokens = (0u64, 0u64);
-    let mut receipt_verified = false;
+    let tokens;
+    let receipt_verified;
     loop {
         match ch.recv_json::<Frame>().expect("frame") {
             Frame::Accepted => {}
@@ -317,14 +317,12 @@ fn preemption_terminates_inflight() {
     });
 
     let mut tokens = 0;
-    let mut preempted = false;
     loop {
         match ch.recv_json::<Frame>() {
             Ok(Frame::Accepted) => {}
             Ok(Frame::Token { .. }) => tokens += 1,
             Ok(Frame::Error { reason }) => {
                 assert!(reason.contains("preempted"), "expected a preemption, got: {reason}");
-                preempted = true;
                 break;
             }
             Ok(Frame::Done { .. }) => panic!("job completed but the owner reclaimed mid-stream"),
@@ -332,6 +330,5 @@ fn preemption_terminates_inflight() {
             Err(e) => panic!("connection died before the preemption frame: {e}"),
         }
     }
-    assert!(preempted, "in-flight job must be terminated by owner reclaim");
     assert!(tokens < 9, "should be cut off before all 9 tokens, got {tokens}");
 }

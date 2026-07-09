@@ -118,6 +118,10 @@ enum Cmd {
         /// Also accept mesh peers on this address (requires membership)
         #[arg(long)]
         mesh_listen: Option<String>,
+        /// Register with a relay and serve peers through it — no inbound port or
+        /// exposed IP needed (e.g. relay.example:4840)
+        #[arg(long)]
+        relay: Option<String>,
         /// Cap CPU Ollama uses: a thread count (e.g. 4) or percent (e.g. 50%)
         #[arg(long)]
         cpu: Option<String>,
@@ -169,11 +173,23 @@ enum MeshCmd {
     Init,
     /// Mint a one-time invite ticket pointing at your mesh address
     Invite {
-        /// Your reachable mesh address, e.g. 203.0.113.5:4830
-        addr: String,
+        /// Your reachable direct mesh address, e.g. 203.0.113.5:4830. Omit when
+        /// using --via-relay.
+        addr: Option<String>,
+        /// Reach you through a relay instead of a direct address — the ticket
+        /// embeds relay://<relay>/<your-node-id>, hiding your IP.
+        #[arg(long)]
+        via_relay: Option<String>,
         /// Ticket lifetime in seconds (default 24h)
         #[arg(long, default_value_t = 86_400)]
         ttl: u64,
+    },
+    /// Run a relay: an org-agnostic rendezvous that brokers connections without
+    /// exposing anyone's IP (forwards only encrypted traffic)
+    Relay {
+        /// Address to listen on, e.g. 0.0.0.0:4840
+        #[arg(long, default_value = "0.0.0.0:4840")]
+        listen: String,
     },
     /// Join an org using an invite ticket
     Join { ticket: String },
@@ -267,9 +283,8 @@ fn run() -> Result<(), String> {
             let matches: Vec<_> = sources::load(&load_opts)?
                 .into_iter()
                 .filter(|m| {
-                    m.display_name().to_lowercase().contains(&q)
-                        || m.name.to_lowercase().contains(&q)
-                        || m.id.to_lowercase().contains(&q)
+                    m.match_keys().iter().any(|k| k.contains(&q))
+                        || m.display_name().to_lowercase().contains(&q)
                         || m.family.to_lowercase().contains(&q)
                 })
                 .collect();
@@ -294,7 +309,7 @@ fn run() -> Result<(), String> {
             }
         }
         #[cfg(feature = "daemon")]
-        Some(Cmd::Serve { listen, mesh_listen, cpu, headless }) => {
+        Some(Cmd::Serve { listen, mesh_listen, relay, cpu, headless }) => {
             let activity = activity::Activity::new();
             let hw = std::sync::Arc::new(hw);
             let cores = proxy::cpu_cores();
@@ -308,12 +323,20 @@ fn run() -> Result<(), String> {
                 );
             }
             let mesh_addr = mesh_listen.clone();
-            if let Some(ml) = mesh_listen {
+            if mesh_listen.is_some() || relay.is_some() {
                 let hw_arc = hw.clone();
                 let host2 = host.clone();
                 let act2 = activity.clone();
+                let ml = mesh_listen.clone();
+                let relay = relay.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = mesh::serve::daemon(&host2, hw_arc, act2, &ml) {
+                    if let Err(e) = mesh::serve::daemon_with_relay(
+                        &host2,
+                        hw_arc,
+                        act2,
+                        ml.as_deref(),
+                        relay.as_deref(),
+                    ) {
                         eprintln!("v2 mesh: not serving to peers: {e}");
                     }
                 });
@@ -395,7 +418,8 @@ fn run_mesh(cmd: MeshCmd, hw: &hardware::HardwareInfo, ctx: u32) -> Result<(), S
     use mesh::client;
     match cmd {
         MeshCmd::Init => client::init(),
-        MeshCmd::Invite { addr, ttl } => client::invite(&addr, ttl),
+        MeshCmd::Invite { addr, via_relay, ttl } => client::invite(addr.as_deref(), via_relay.as_deref(), ttl),
+        MeshCmd::Relay { listen } => mesh::relay::run_relay(&listen),
         MeshCmd::Join { ticket } => client::join(&ticket),
         MeshCmd::Status => client::status(),
         MeshCmd::Peers => client::peers(),

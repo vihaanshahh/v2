@@ -13,8 +13,6 @@ pub struct RunningModel {
     pub size: u64,
     #[serde(default)]
     pub size_vram: u64,
-    #[serde(default)]
-    pub expires_at: String,
 }
 
 #[derive(Debug, Deserialize)]

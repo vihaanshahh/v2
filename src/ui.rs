@@ -65,6 +65,7 @@ fn box_width() -> usize {
 /// Truncate a plain string to a visible width, adding `…` if it was cut. Meant
 /// for pre-colour text (call before applying ANSI), so lines never overflow a
 /// narrow terminal and wrap. Widths ≤ 1 collapse to the ellipsis alone.
+#[cfg(feature = "daemon")]
 pub fn truncate(s: &str, width: usize) -> String {
     if visible_len(s) <= width {
         return s.to_string();
@@ -119,6 +120,7 @@ pub fn section(title: &str) {
 }
 
 /// A coloured status badge: `[ ok ]`, `[ !! ]`, `[ xx ]`.
+#[cfg(feature = "daemon")]
 pub fn badge(kind: Badge) -> String {
     match kind {
         Badge::Ok => format!("[{}]", " ok ".green()),
@@ -128,6 +130,7 @@ pub fn badge(kind: Badge) -> String {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(feature = "daemon")]
 pub enum Badge {
     Ok,
     Warn,
@@ -135,6 +138,7 @@ pub enum Badge {
 }
 
 /// A compact unicode meter, e.g. `████████░░░░ 63%`.
+#[cfg(feature = "daemon")]
 pub fn bar(fraction: f64, width: usize) -> String {
     let f = fraction.clamp(0.0, 1.0);
     let filled = (f * width as f64).round() as usize;

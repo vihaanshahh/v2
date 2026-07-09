@@ -235,7 +235,9 @@ pub fn evaluate<'a>(
     Vec<(Quant, CompatResult)>,
     Option<(Quant, CompatResult)>,
 ) {
-    let all_quants = if let Some(q) = model.fixed_quant {
+    let all_quants = if let Some(q) = quant_filter {
+        vec![(q, check(model, q, hw, ctx))]
+    } else if let Some(q) = model.fixed_quant {
         vec![(q, check(model, q, hw, ctx))]
     } else {
         Quant::all()
@@ -244,11 +246,61 @@ pub fn evaluate<'a>(
             .collect()
     };
 
-    let best = if let Some(q) = quant_filter {
-        Some((q, check(model, q, hw, ctx)))
+    let best = if quant_filter.is_some() {
+        all_quants.first().and_then(|(q, result)| {
+            if matches!(result.fit, FitType::TooBig) {
+                None
+            } else {
+                Some((*q, result.clone()))
+            }
+        })
     } else {
         best_quant(model, hw, ctx)
     };
 
     (model, all_quants, best)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hardware::Os;
+    use crate::models::ModelOrigin;
+
+    fn model(params: u64) -> Model {
+        Model {
+            name: "test".into(),
+            family: "test".into(),
+            params,
+            params_active: None,
+            is_moe: false,
+            context_length: 4096,
+            id: "test/test".into(),
+            ollama_name: Some("test:32b".into()),
+            weight_bytes: None,
+            fixed_quant: None,
+            origin: ModelOrigin::Catalog,
+        }
+    }
+
+    fn cpu_hw(ram_gb: u64) -> HardwareInfo {
+        HardwareInfo {
+            gpus: vec![],
+            cpu_name: "test cpu".into(),
+            ram_bytes: ram_gb * GIB,
+            os: Os::Linux,
+        }
+    }
+
+    #[test]
+    fn quant_filter_limits_results_and_does_not_recommend_too_big() {
+        let m = model(32_000_000_000);
+        let (_, quants, best) = evaluate(&m, &cpu_hw(32), 4096, Some(Quant::F16));
+
+        assert!(best.is_none());
+        assert_eq!(quants.len(), 1);
+        assert_eq!(quants[0].0, Quant::F16);
+        assert!(matches!(quants[0].1.fit, FitType::TooBig));
+    }
 }

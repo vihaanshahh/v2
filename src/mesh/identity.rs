@@ -227,10 +227,6 @@ pub struct MembershipCert {
 }
 
 impl MembershipCert {
-    pub fn node_pub_bytes(&self) -> Result<[u8; 32], String> {
-        unb64_arr::<32>(&self.node_pub)
-    }
-
     /// Verify signature, org binding, and freshness. Fail closed (I2): any error
     /// returns Err with a reason and the caller drops the connection.
     pub fn verify(&self, trusted_org_pub: &[u8; 32], now: u64) -> Result<(), String> {

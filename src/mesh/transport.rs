@@ -35,8 +35,19 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(300);
 const SESSION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dial with a connect timeout (never block indefinitely on a black-holed host).
+/// Resolve an address to a live TCP stream. A `relay://<relay-addr>/<node_pub>`
+/// address is dialed through the relay (which returns a stream already spliced
+/// end-to-end to the target); everything else is a direct `host:port` dial. The
+/// Noise handshake above runs identically on either — the relay is invisible.
 fn dial(addr: &str) -> Result<TcpStream, String> {
+    match super::relay::parse_route(addr) {
+        super::relay::Route::Direct(a) => dial_direct(&a),
+        super::relay::Route::Relay { relay, node_pub } => super::relay::dial_via_relay(&relay, &node_pub),
+    }
+}
+
+/// Dial with a connect timeout (never block indefinitely on a black-holed host).
+fn dial_direct(addr: &str) -> Result<TcpStream, String> {
     let mut last = String::from("no address resolved");
     let addrs = addr.to_socket_addrs().map_err(|e| format!("resolve {addr}: {e}"))?;
     for sa in addrs {
@@ -89,23 +100,6 @@ pub struct Channel {
 }
 
 impl Channel {
-    pub fn handshake_hash(&self) -> &[u8] {
-        &self.hash
-    }
-
-    pub fn peer_addr(&self) -> String {
-        self.stream
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "?".into())
-    }
-
-    /// Close the underlying socket now. Used by the reclaim path (H3): dropping
-    /// the connection aborts any in-flight upstream generation.
-    pub fn shutdown(&mut self) {
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
-    }
-
     /// Relax the short handshake timeouts to session values once authenticated.
     fn relax_timeouts(&self) {
         let _ = self.stream.set_read_timeout(Some(SESSION_READ_TIMEOUT));

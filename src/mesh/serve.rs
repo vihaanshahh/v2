@@ -26,7 +26,6 @@ use super::proto::{CoSign, EnrollResponse, Frame, Receipt, Request};
 use super::transport::{self, Channel, Peer};
 use super::{b64, short_id, unb64_arr};
 
-const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 const QUOTA_WINDOW: u64 = 3600;
 
 /// Everything a connection thread needs. All fields are cheap to clone (Arc).
@@ -429,7 +428,25 @@ pub fn pause_flag() -> Result<std::path::PathBuf, String> {
 /// `listen`. Requires membership. Spawns a watcher that mirrors the pause flag
 /// file into the shared atomic so `v2 mesh pause` (a different process) is
 /// honored within ~1s (H3).
-pub fn daemon(ollama_host: &str, hw: Arc<HardwareInfo>, activity: Activity, listen: &str) -> Result<(), String> {
+/// Full serving assembly with optional direct listener and/or relay registration.
+/// At least one of `listen` / `relay` should be set, or the node offers nothing.
+///
+/// When `relay` is set the node dials *out* to the relay and serves inbound
+/// sessions through it (no open inbound port needed). Relay-mediated connections
+/// skip the per-IP flood gate — every one arrives from the relay's IP, so that
+/// gate can't distinguish peers — but every node-level check (bans, quotas,
+/// admission, federation scope) still applies, since those key on the node id
+/// proven by channel binding.
+pub fn daemon_with_relay(
+    ollama_host: &str,
+    hw: Arc<HardwareInfo>,
+    activity: Activity,
+    listen: Option<&str>,
+    relay: Option<&str>,
+) -> Result<(), String> {
+    if listen.is_none() && relay.is_none() {
+        return Err("nothing to serve on: pass --mesh-listen and/or --relay".into());
+    }
     let node = Arc::new(NodeKey::load_or_create()?);
     let ident = MeshIdentity::load()?
         .ok_or("not a mesh member; run `v2 mesh join <ticket>` or `v2 mesh init`")?;
@@ -463,7 +480,35 @@ pub fn daemon(ollama_host: &str, hw: Arc<HardwareInfo>, activity: Activity, list
         org_root: OrgRoot::load().ok().map(Arc::new),
         used_nonces: Arc::new(Mutex::new(load_nonces())),
     };
-    run(ctx, listen)
+
+    // Relay registration: dial out and serve mediated sessions through the same
+    // `handle` pipeline as a direct connection (auth + admission + reclaim all
+    // run end-to-end over the spliced, Noise-encrypted channel).
+    if let Some(relay) = relay {
+        let relay = relay.to_string();
+        let node = ctx.node.clone();
+        let rctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = super::relay::register(&relay, node, move |stream| {
+                handle(rctx.clone(), stream);
+            });
+        });
+    }
+
+    match listen {
+        Some(listen) => run(ctx, listen),
+        None => {
+            // Relay-only: park the main thread so the process (and the relay
+            // registration thread) stays alive.
+            println!(
+                "v2 mesh  serving via relay only as {} — no direct port bound",
+                short_id(&ctx.node.public_b64())
+            );
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
+    }
 }
 
 /// Best-effort AC-power detection. Unknown -> true (most serving nodes are

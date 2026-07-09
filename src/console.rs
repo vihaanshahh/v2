@@ -560,7 +560,7 @@ fn invite_flow(mesh_listen: Option<&str>) {
         return;
     }
     println!("  {}", "share this one-time ticket with your teammate:".dimmed());
-    if let Err(e) = client::invite(&addr, 86_400) {
+    if let Err(e) = client::invite(Some(&addr), None, 86_400) {
         warn(&e);
     }
 }

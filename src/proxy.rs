@@ -7,14 +7,22 @@
 //! reader drops, and Ollama aborts generation. The metering record is still
 //! written from the reader's Drop, so partial usage is never lost.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::activity::Activity;
+use crate::endpoints::{self, ApiKind};
 use crate::ollama_api::GenStats;
 use crate::usage::{self, UsageRecord};
+
+/// Optional bearer token guarding the OpenAI-compatible `/v1/*` surface. When
+/// `V2_API_KEY` is set, `/v1` requests must carry `Authorization: Bearer <key>`;
+/// unset means open (fine for the default loopback bind, not for exposed ones).
+fn api_key() -> Option<String> {
+    std::env::var("V2_API_KEY").ok().filter(|k| !k.is_empty())
+}
 
 /// A live, runtime-adjustable cap on the CPU threads Ollama may use per request.
 /// `0` means no cap. Shared with the interactive panel so you can dial it while
@@ -62,6 +70,26 @@ fn handle(mut request: tiny_http::Request, ollama_host: &str, activity: &Activit
     let url = request.url().to_string();
     let model = String::new(); // filled in below if we can see it in the body
 
+    // ── OpenAI-compatible surface (`/v1/*`) ──────────────────────────────────
+    // Lets any OpenAI SDK / tool point its Base URL at v2. Local models flow
+    // straight to Ollama's native `/v1`; a model id registered as a remote
+    // endpoint is reverse-proxied there with its stored key. Guarded by an
+    // optional bearer token so an exposed bind isn't an open relay to your keys.
+    let is_openai = url.starts_with("/v1/");
+    if is_openai {
+        if let Some(key) = api_key() {
+            if header_value(&request, "authorization").as_deref() != Some(&format!("Bearer {key}")) {
+                let response = tiny_http::Response::from_string("{\"error\":{\"message\":\"invalid or missing api key\",\"type\":\"invalid_request_error\"}}")
+                    .with_status_code(401);
+                let _ = request.respond(response);
+                return Ok(());
+            }
+        }
+        if method == "GET" && url.trim_end_matches('/').ends_with("/v1/models") {
+            return respond_openai_models(request, ollama_host);
+        }
+    }
+
     // Read the incoming body (the prompt). In memory only — never written to disk.
     // Bounded by MAX_REQUEST_BODY: we read one byte past the limit so we can tell
     // "exactly at the cap" from "over it", then refuse anything over with 413
@@ -80,15 +108,40 @@ fn handle(mut request: tiny_http::Request, ollama_host: &str, activity: &Activit
     }
 
     let model = detect_model(&body).unwrap_or(model);
-    // Cap CPU usage by asking Ollama for fewer inference threads, unless the
-    // caller already specified their own num_thread.
-    let body = if cpu_threads > 0 { cap_cpu_threads(body, cpu_threads) } else { body };
 
-    let upstream_url = format!("{ollama_host}{url}");
+    // Choose the upstream. Default is local Ollama. On the `/v1` surface, a model
+    // id matching a registered OpenAI endpoint (by model id or friendly name) is
+    // reverse-proxied to that host with its stored key and canonical model id.
+    let mut upstream_base = ollama_host.to_string();
+    let mut auth: Option<String> = None;
+    let mut body = body;
+    if is_openai {
+        if let Some(ep) = endpoints::load()
+            .into_iter()
+            .find(|e| e.kind == ApiKind::Openai && (e.model == model || e.name == model))
+        {
+            // Base may or may not already end in `/v1`; the request path carries
+            // its own `/v1`, so strip a trailing one to avoid `/v1/v1`.
+            let base = ep.url.trim_end_matches('/');
+            upstream_base = base.strip_suffix("/v1").unwrap_or(base).to_string();
+            auth = ep.api_key.clone();
+            body = rewrite_model(body, &ep.model);
+        }
+    }
+    let routed_remote = upstream_base != ollama_host;
+
+    // Cap CPU only for local Ollama jobs (a remote endpoint has no num_thread).
+    let body = if cpu_threads > 0 && !routed_remote { cap_cpu_threads(body, cpu_threads) } else { body };
+
+    let upstream_url = format!("{upstream_base}{url}");
     let mut req = ureq::request(&method, &upstream_url);
-    // Forward content-type so Ollama parses JSON bodies.
+    // Forward content-type so the upstream parses JSON bodies.
     if let Some(ct) = header_value(&request, "content-type") {
         req = req.set("Content-Type", &ct);
+    }
+    // Inject the endpoint's own key (never the caller's) when routed remotely.
+    if let Some(key) = auth.as_deref().filter(|k| !k.is_empty()) {
+        req = req.set("Authorization", &format!("Bearer {key}"));
     }
 
     let resp = if body.is_empty() {
@@ -140,6 +193,39 @@ fn header_value(request: &tiny_http::Request, name: &str) -> Option<String> {
 fn detect_model(body: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     v.get("model")?.as_str().map(|s| s.to_string())
+}
+
+/// Replace the `model` field so a request addressed by an endpoint's friendly
+/// name (or id) reaches the upstream with the id it actually expects.
+fn rewrite_model(body: Vec<u8>, model: &str) -> Vec<u8> {
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else { return body };
+    let Some(obj) = v.as_object_mut() else { return body };
+    obj.insert("model".into(), serde_json::json!(model));
+    serde_json::to_vec(&v).unwrap_or(body)
+}
+
+/// `GET /v1/models`: OpenAI-shaped catalog merging local Ollama tags with every
+/// registered remote endpoint, so a client's model picker sees one unified list.
+fn respond_openai_models(request: tiny_http::Request, ollama_host: &str) -> Result<(), String> {
+    let mut data: Vec<serde_json::Value> = Vec::new();
+    let mut push = |id: &str, owner: &str| {
+        data.push(serde_json::json!({ "id": id, "object": "model", "owned_by": owner }));
+    };
+    for tag in crate::ollama::fetch_local(ollama_host)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| m.ollama_name)
+    {
+        push(&tag, "ollama");
+    }
+    for ep in endpoints::load() {
+        push(&ep.model, &format!("endpoint:{}", ep.name));
+    }
+    let payload = serde_json::json!({ "object": "list", "data": data }).to_string();
+    let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+        .map_err(|_| "bad content-type header".to_string())?;
+    let response = tiny_http::Response::from_string(payload).with_header(header);
+    request.respond(response).map_err(|e| format!("respond: {e}"))
 }
 
 /// Inject `options.num_thread = threads` into a generate/chat body so Ollama
@@ -300,12 +386,6 @@ impl<R: Read> Drop for MeteringReader<R> {
     }
 }
 
-/// A minimal write helper used by `v2 serve` startup to report readiness.
-pub fn banner(msg: &str) {
-    let _ = std::io::stdout().write_all(msg.as_bytes());
-    let _ = std::io::stdout().write_all(b"\n");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +396,22 @@ mod tests {
 {"message":{"content":" there"},"done":false}
 {"message":{"content":""},"done":true,"prompt_eval_count":11,"eval_count":42,"total_duration":900000000}
 "#;
+
+    #[test]
+    fn rewrite_model_swaps_only_the_model_field() {
+        let body = br#"{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}],"stream":true}"#.to_vec();
+        let out = rewrite_model(body, "gpt-5.5-turbo");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "gpt-5.5-turbo");
+        assert_eq!(v["messages"][0]["content"], "hi"); // rest untouched
+        assert_eq!(v["stream"], true);
+    }
+
+    #[test]
+    fn rewrite_model_leaves_non_json_untouched() {
+        let body = b"not json".to_vec();
+        assert_eq!(rewrite_model(body.clone(), "x"), body);
+    }
 
     #[test]
     fn meters_tokens_from_stream_and_passes_bytes_through() {

@@ -139,7 +139,13 @@ pub fn estimate_tps(
     if eff_bw <= 0.0 {
         return None;
     }
-    Some((eff_bw / bpt, !exact))
+
+    let rough = match fit {
+        FitType::FullGpu => !exact,
+        FitType::PartialOffload { .. } | FitType::CpuOnly => true,
+        FitType::TooBig => return None,
+    };
+    Some((eff_bw / bpt, rough))
 }
 
 /// Compact human label, e.g. "48 tok/s" or "~6 tok/s" for rough estimates.

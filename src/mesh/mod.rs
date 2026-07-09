@@ -14,6 +14,7 @@ pub mod client;
 pub mod gossip;
 pub mod identity;
 pub mod proto;
+pub mod relay;
 pub mod serve;
 pub mod transport;
 

@@ -180,9 +180,10 @@ pub fn print_results(
                         tps_cell(model, *q, ctx, hw, &r.fit).dimmed(),
                     );
                 }
-            } else if best_r.notes.iter().any(|n| !n.contains("shared")) {
+            } else {
                 for note in &best_r.notes {
-                    if !note.contains("shared") {
+                    let redundant_cpu_note = hw.gpus.is_empty() && note.starts_with("CPU only");
+                    if !note.contains("shared") && !redundant_cpu_note {
                         println!("       {}", note.yellow());
                     }
                 }

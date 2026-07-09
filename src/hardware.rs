@@ -462,6 +462,7 @@ fn detect_cpu_name(os: &Os) -> String {
 /// stores model weights). Shells out like the rest of detection; returns `None`
 /// if the platform tool is missing or its output can't be parsed, so callers
 /// degrade gracefully to "disk space unknown".
+#[cfg(feature = "daemon")]
 pub fn disk_free_bytes(path: &std::path::Path) -> Option<u64> {
     let p = path.to_string_lossy();
     match detect_os() {
