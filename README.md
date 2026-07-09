@@ -121,7 +121,16 @@ per_peer_tokens_per_hour = 200_000
 hours            = "09:00-18:00"
 require_ac_power = true
 yield_to_local   = true    # the moment you use the machine, remote work is evicted
+
+[endpoint]                       # the OpenAI-compatible /v1 surface (v2 serve)
+public_url = "https://your-host" # advertise this as the Base URL (clients get <url>/v1)
+# api_key  = ""                  # empty → auto-persisted key at ~/.v2/api_key
+# open     = false               # true → no bearer gate (loopback-only trust)
 ```
+
+The `/v1` surface is **key-gated by default** — v2 auto-creates a key at
+`~/.v2/api_key` on first serve, so exposing it needs no setup. Run
+`v2 endpoint` any time to print the paste-ready Base URL + key + model list.
 
 **Get your laptop back, instantly:**
 

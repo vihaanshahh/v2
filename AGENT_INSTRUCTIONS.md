@@ -84,10 +84,17 @@ curl -s --retry 20 --retry-all-errors -o /dev/null http://127.0.0.1:11435/api/ta
 v2 endpoint                       # prints the paste-ready Base URL + key + models
 ```
 
-Knobs (all optional):
-- `V2_API_KEY=<key>` — pin a specific key instead of the auto-generated one.
-- `V2_PUBLIC_URL=https://…` — advertise a public/tunnel URL as the Base URL (behind a reverse proxy or a platform service).
-- `V2_OPEN=1` — disable the gate entirely (only for trusted loopback use).
+Knobs — set in `~/.v2/policy.toml` (the natural, persistent way) **or** via env
+(env wins, for managed platforms that inject values):
+
+```toml
+[endpoint]
+public_url = "https://your-host"   # advertised Base URL (clients get <url>/v1)
+# api_key  = ""                     # empty → auto key at ~/.v2/api_key
+# open     = false                  # true → no bearer gate (loopback only)
+```
+
+Env equivalents: `V2_PUBLIC_URL`, `V2_API_KEY`, `V2_OPEN=1`.
 
 Point a client at it (values come straight from `v2 endpoint`):
 

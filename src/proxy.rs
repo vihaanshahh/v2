@@ -17,24 +17,33 @@ use crate::endpoints::{self, ApiKind};
 use crate::ollama_api::GenStats;
 use crate::usage::{self, UsageRecord};
 
-/// Bearer token guarding the OpenAI-compatible `/v1/*` surface. Resolution order:
-///   1. `V2_OPEN=1` (or true/yes/on) → no gate. Explicit opt-out for trusted,
-///      loopback-only use where you want zero auth.
-///   2. `V2_API_KEY` set & non-empty → use it verbatim (what a managed service sets).
+/// The `[endpoint]` section of `~/.v2/policy.toml` (defaults if absent/unreadable).
+fn endpoint_cfg() -> crate::policy::EndpointPolicy {
+    crate::policy::Policy::load().map(|p| p.endpoint).unwrap_or_default()
+}
+
+/// Bearer token guarding the OpenAI-compatible `/v1/*` surface. Resolution order
+/// (env overrides config so a managed platform can inject values):
+///   1. `V2_OPEN=1` env or `endpoint.open = true` → no gate. Trusted local use only.
+///   2. `V2_API_KEY` env, else `endpoint.api_key` config → use it verbatim.
 ///   3. otherwise → load-or-create a persisted key at `~/.v2/api_key`.
 /// So `/v1` is **key-gated by default** and safe to expose with no setup — you
 /// never have to invent or wire a key yourself.
 fn resolved_api_key() -> Option<String> {
-    let open = std::env::var("V2_OPEN")
+    let cfg = endpoint_cfg();
+    let env_open = std::env::var("V2_OPEN")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
-    if open {
+    if env_open || cfg.open {
         return None;
     }
     if let Ok(k) = std::env::var("V2_API_KEY") {
         if !k.trim().is_empty() {
             return Some(k);
         }
+    }
+    if !cfg.api_key.trim().is_empty() {
+        return Some(cfg.api_key);
     }
     load_or_create_key()
 }
@@ -65,7 +74,12 @@ fn load_or_create_key() -> Option<String> {
 /// shown as the primary Base URL so a reverse-proxied/tunnelled deployment
 /// advertises its real address. Callable standalone via `v2 endpoint`.
 pub fn print_endpoint_banner(listen: &str, ollama_host: &str) {
-    let public = std::env::var("V2_PUBLIC_URL").ok().map(|u| u.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty());
+    // Public URL: env wins, then the `[endpoint] public_url` config.
+    let public = std::env::var("V2_PUBLIC_URL")
+        .ok()
+        .or_else(|| Some(endpoint_cfg().public_url))
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty());
     let key = resolved_api_key();
     let models: Vec<String> = crate::ollama::fetch_local(ollama_host)
         .unwrap_or_default()

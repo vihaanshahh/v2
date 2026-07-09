@@ -14,6 +14,29 @@ pub struct Policy {
     pub quota: QuotaPolicy,
     pub availability: AvailabilityPolicy,
     pub abuse: AbusePolicy,
+    pub endpoint: EndpointPolicy,
+}
+
+/// The OpenAI-compatible `/v1` surface exposed by `v2 serve`. Everything here is
+/// optional and safe by default: the surface is key-gated, local-only, and
+/// advertises no public address unless you set one.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EndpointPolicy {
+    /// Public/tunnel base URL to advertise as the Base URL (e.g.
+    /// "https://host"). Empty = local bind only. `/v1` is appended for clients.
+    pub public_url: String,
+    /// Pin a specific API key. Empty = use the auto-persisted `~/.v2/api_key`.
+    pub api_key: String,
+    /// Disable the `/v1` bearer gate entirely. Only for trusted, loopback-only
+    /// use — never with a `public_url` set.
+    pub open: bool,
+}
+
+impl Default for EndpointPolicy {
+    fn default() -> Self {
+        Self { public_url: String::new(), api_key: String::new(), open: false }
+    }
 }
 
 /// Flood / DoS controls, applied to *every* connection (members included).
@@ -92,6 +115,7 @@ impl Default for Policy {
             quota: QuotaPolicy::default(),
             availability: AvailabilityPolicy::default(),
             abuse: AbusePolicy::default(),
+            endpoint: EndpointPolicy::default(),
         }
     }
 }
