@@ -21,6 +21,11 @@ v2  24G vram · 64G ram · Linux · 4k ctx · catalog
 
 ## Install
 
+> 🤖 **Using an AI agent?** Hand it [`AGENT_INSTRUCTIONS.md`](AGENT_INSTRUCTIONS.md) —
+> a copy-paste, agent-executable guide that installs v2, wires it to Ollama, picks
+> the right model for the machine, and sets up the mesh, a relay, and the
+> OpenAI-compatible endpoint end to end.
+
 **From source** (needs a recent Rust toolchain):
 
 ```bash
@@ -164,6 +169,7 @@ including a job terminated **mid-generation** by owner reclaim.
 
 ## Documentation
 
+- **[AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md)** — copy-paste setup for AI agents: install → model pick → serve → OpenAI endpoint → mesh → relay.
 - **[docs/GUIDE.md](docs/GUIDE.md)** — getting started: scan, manage, meter.
 - **[docs/MESH.md](docs/MESH.md)** — the org mesh: setup, trust model, ops, federation.
 - **[docs/CONFIG.md](docs/CONFIG.md)** — `policy.toml`, the `~/.v2` file layout, env vars.
