@@ -1,2 +1,7 @@
 /target/
 /dist/
+/web/node_modules/
+/web/dist/
+/desktop/node_modules/
+/desktop/src-tauri/target/
+/desktop/src-tauri/gen/

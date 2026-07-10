@@ -7,9 +7,10 @@
 use std::io::{self, Write};
 
 use colored::Colorize;
+use serde::Serialize;
 
 use crate::bandwidth;
-use crate::engine::{self, FitType};
+use crate::engine::{self, fit_type_str, FitType};
 use crate::hardware::HardwareInfo;
 use crate::models::{catalog, Model, ModelOrigin, Quant};
 use crate::ollama;
@@ -17,9 +18,65 @@ use crate::ollama_api;
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
+/// Pure data version of `fit_preview` — no I/O, reusable by the desktop app's
+/// pull-confirmation dialog (the CLI keeps its own inline-printed preview).
+#[derive(Debug, Clone, Serialize)]
+pub struct FitCheck {
+    pub display_name: String,
+    pub in_catalog: bool,
+    pub fits: bool,
+    pub fit: String,
+    pub quant: Option<String>,
+    pub vram_gb: Option<f64>,
+    pub est_tps: Option<f64>,
+    pub notes: Vec<String>,
+}
+
+pub fn fit_check(query: &str, hw: &HardwareInfo, ctx: u32) -> FitCheck {
+    let Some(model) = resolve(query) else {
+        return FitCheck {
+            display_name: query.to_string(),
+            in_catalog: false,
+            fits: false,
+            fit: "unknown".into(),
+            quant: None,
+            vram_gb: None,
+            est_tps: None,
+            notes: vec!["not in catalog — no fit estimate".into()],
+        };
+    };
+
+    let Some((quant, result)) = engine::best_quant(&model, hw, ctx) else {
+        return FitCheck {
+            display_name: model.display_name().to_string(),
+            in_catalog: true,
+            fits: false,
+            fit: fit_type_str(&FitType::TooBig).to_string(),
+            quant: None,
+            vram_gb: None,
+            est_tps: None,
+            notes: vec!["will not fit on this machine".into()],
+        };
+    };
+
+    let est_tps = bandwidth::estimate_tps(&model, quant, ctx, hw, &result.fit)
+        .map(|(t, _)| (t * 10.0).round() / 10.0);
+
+    FitCheck {
+        display_name: model.display_name().to_string(),
+        in_catalog: true,
+        fits: true,
+        fit: fit_type_str(&result.fit).to_string(),
+        quant: Some(quant.label().to_string()),
+        vram_gb: Some(result.vram_required as f64 / GIB),
+        est_tps,
+        notes: result.notes,
+    }
+}
+
 /// Resolve a user query ("qwen3:8b", "llama3.1") to a catalog model, or infer a
 /// minimal one from the tag so we can still estimate fit.
-pub(crate) fn resolve(query: &str) -> Option<Model> {
+pub fn resolve(query: &str) -> Option<Model> {
     let q = query.to_lowercase();
     let cat = catalog();
     // Exact ollama tag, then prefix, then name/family substring.
@@ -146,30 +203,87 @@ pub fn rm(host: &str, model: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Installed models with fit info for this machine — pure data, shared by `v2
+/// ps` (prints it) and the desktop app's Models tab (renders it).
+#[derive(Debug, Clone, Serialize)]
+pub struct InstalledModel {
+    pub name: String,
+    pub display_name: String,
+    pub size_gb: Option<f64>,
+    pub fit: String,
+    pub offload_pct: Option<u8>,
+    pub quant: Option<String>,
+    pub est_tps: Option<f64>,
+    pub tps_label: Option<String>,
+}
+
+pub fn installed_with_fit(host: &str, hw: &HardwareInfo, ctx: u32) -> Result<Vec<InstalledModel>, String> {
+    let mut rows = ollama::fetch_local(host)?;
+    rows.sort_by(|a, b| a.display_name().cmp(b.display_name()));
+    Ok(rows
+        .iter()
+        .map(|m| {
+            let size_gb = m.weight_bytes.map(|b| b as f64 / GIB);
+            match engine::best_quant(m, hw, ctx) {
+                Some((q, r)) => {
+                    let (est_tps, tps_label) = match bandwidth::estimate_tps(m, q, ctx, hw, &r.fit) {
+                        Some((t, rough)) => (Some((t * 10.0).round() / 10.0), Some(bandwidth::tps_label(t, rough))),
+                        None => (None, None),
+                    };
+                    let offload_pct = match r.fit {
+                        FitType::PartialOffload { offload_pct } => Some(offload_pct),
+                        _ => None,
+                    };
+                    InstalledModel {
+                        name: m.name.clone(),
+                        display_name: m.display_name().to_string(),
+                        size_gb,
+                        fit: fit_type_str(&r.fit).to_string(),
+                        offload_pct,
+                        quant: Some(q.label().to_string()),
+                        est_tps,
+                        tps_label,
+                    }
+                }
+                None => InstalledModel {
+                    name: m.name.clone(),
+                    display_name: m.display_name().to_string(),
+                    size_gb,
+                    fit: fit_type_str(&FitType::TooBig).to_string(),
+                    offload_pct: None,
+                    quant: None,
+                    est_tps: None,
+                    tps_label: None,
+                },
+            }
+        })
+        .collect())
+}
+
 /// `v2 ps` — installed models with fit info for this machine.
 pub fn ps_installed(host: &str, hw: &HardwareInfo, ctx: u32) -> Result<(), String> {
-    let installed = ollama::fetch_local(host)?;
-    if installed.is_empty() {
+    let rows = installed_with_fit(host, hw, ctx)?;
+    if rows.is_empty() {
         println!("v2 ps  no models installed  (try `v2 pull qwen3:8b`)");
         return Ok(());
     }
-    crate::ui::section(&format!("installed  ({})", installed.len()));
-    let mut rows = installed;
-    rows.sort_by(|a, b| a.display_name().cmp(b.display_name()));
+    crate::ui::section(&format!("installed  ({})", rows.len()));
     for m in &rows {
-        let size = m.weight_bytes.map(|b| format!("{:.1}G", b as f64 / GIB)).unwrap_or_default();
-        let (fit, speed) = match engine::best_quant(m, hw, ctx) {
-            Some((q, r)) => {
-                let s = bandwidth::estimate_tps(m, q, ctx, hw, &r.fit)
-                    .map(|(t, rough)| bandwidth::tps_label(t, rough))
-                    .unwrap_or_default();
-                (fit_word(&r.fit), s)
-            }
-            None => ("n/a".red().to_string(), String::new()),
-        };
-        println!("  {:<28} {:>7}  {:<18} {}", m.display_name(), size, fit, speed.dimmed());
+        let size = m.size_gb.map(|g| format!("{g:.1}G")).unwrap_or_default();
+        let fit = fit_word_str(&m.fit, m.offload_pct);
+        let speed = m.tps_label.clone().unwrap_or_default();
+        println!("  {:<28} {:>7}  {:<18} {}", m.display_name, size, fit, speed.dimmed());
     }
     Ok(())
+}
+
+fn fit_word_str(fit: &str, offload_pct: Option<u8>) -> String {
+    match fit {
+        "full_gpu" => "gpu".green().to_string(),
+        "partial_offload" => format!("~{}% offload", offload_pct.unwrap_or(0)).yellow().to_string(),
+        "cpu_only" => "cpu".dimmed().to_string(),
+        _ => "n/a".red().to_string(),
+    }
 }
 
 /// `v2 run <model>` — ensure it's installed (pull if missing), then chat.
@@ -225,14 +339,6 @@ fn chat_repl(host: &str, model: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn fit_word(fit: &FitType) -> String {
-    match fit {
-        FitType::FullGpu => "gpu".green().to_string(),
-        FitType::PartialOffload { offload_pct } => format!("~{}% offload", offload_pct).yellow().to_string(),
-        FitType::CpuOnly => "cpu".dimmed().to_string(),
-        FitType::TooBig => "n/a".red().to_string(),
-    }
-}
 
 fn confirm(prompt: &str) -> bool {
     print!("{prompt} [Y/n] ");
@@ -259,5 +365,54 @@ mod tests {
     fn infers_unknown_tag() {
         let m = resolve("someorg-13b:latest").expect("inferred");
         assert_eq!(m.params, 13_000_000_000);
+    }
+
+    fn beefy_hw() -> HardwareInfo {
+        HardwareInfo {
+            gpus: vec![crate::hardware::GpuInfo {
+                name: "RTX 4090".into(),
+                vendor: crate::hardware::Vendor::Nvidia,
+                vram_bytes: 24 << 30,
+                shared_memory: false,
+            }],
+            cpu_name: "test cpu".into(),
+            ram_bytes: 64 << 30,
+            os: crate::hardware::Os::Linux,
+        }
+    }
+
+    // `fit_check` is the data function behind the desktop app's pull-preview
+    // dialog (and shares its wording vocabulary with `--json`'s `fit_type_str`)
+    // — this is the "API test" for that command's underlying logic.
+    #[test]
+    fn fit_check_known_model_reports_fit_and_speed() {
+        let check = fit_check("qwen3:8b", &beefy_hw(), 4096);
+        assert!(check.in_catalog);
+        assert!(check.fits);
+        assert_eq!(check.fit, "full_gpu");
+        assert!(check.quant.is_some());
+        assert!(check.vram_gb.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn fit_check_unknown_query_has_no_estimate() {
+        let check = fit_check("not-a-real-model-xyz", &beefy_hw(), 4096);
+        assert!(!check.in_catalog);
+        assert!(!check.fits);
+        assert_eq!(check.fit, "unknown");
+        assert!(check.quant.is_none());
+        assert!(!check.notes.is_empty());
+    }
+
+    #[test]
+    fn fit_check_oversized_model_reports_too_big() {
+        // Inferred (not catalog) tag with an absurd param count: guarantees
+        // nothing fits, even on the beefy test rig — proves fit_check's
+        // "in catalog but will not fit" branch, not just the happy path.
+        let check = fit_check("hugeorg-900b:latest", &beefy_hw(), 4096);
+        assert!(check.in_catalog);
+        assert!(!check.fits);
+        assert_eq!(check.fit, "too_big");
+        assert!(check.quant.is_none());
     }
 }

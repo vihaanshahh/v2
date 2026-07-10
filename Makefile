@@ -1,6 +1,15 @@
-.PHONY: check test build release package
+.PHONY: check test build release package desktop-dev desktop-build prepush hooks
 
 check: test build
+
+# Full check plus the desktop app's build surface (Tauri crate + frontend
+# typecheck). What the pre-push hook runs; also runnable standalone.
+prepush:
+	./.githooks/pre-push
+
+hooks:
+	git config core.hooksPath .githooks
+	@echo "pre-push hook enabled (git config core.hooksPath .githooks)"
 
 test:
 	cargo test
@@ -9,6 +18,15 @@ build:
 	cargo build --release
 
 release: build
+
+# Desktop app: run `npm run dev` in web/ in one terminal, then this in another —
+# tauri dev attaches to the already-running Vite server at :5173.
+desktop-dev:
+	cd desktop && npm run dev
+
+desktop-build:
+	cd web && npm run build
+	cd desktop && npm run build
 
 package: build
 	@mkdir -p dist

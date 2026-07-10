@@ -2,7 +2,7 @@ use colored::Colorize;
 
 use crate::accepted::AcceptedModels;
 use crate::bandwidth;
-use crate::engine::{CompatResult, FitType};
+use crate::engine::{fit_type_str, CompatResult, FitType};
 use crate::hardware::HardwareInfo;
 use crate::models::{Model, ModelOrigin, Quant};
 use crate::sources::LoadOptions;
@@ -249,6 +249,23 @@ pub fn print_json(
     )],
     ctx: u32,
 ) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&scan_json(hw, results, ctx)).unwrap_or_default()
+    );
+}
+
+/// Pure data builder behind `print_json` — no I/O, so it's reusable in-process
+/// (e.g. by the desktop app's `scan` command) without going through stdout.
+pub fn scan_json(
+    hw: &HardwareInfo,
+    results: &[(
+        &Model,
+        Vec<(Quant, CompatResult)>,
+        Option<(Quant, CompatResult)>,
+    )],
+    ctx: u32,
+) -> serde_json::Value {
     use std::collections::HashMap;
 
     let gpus: Vec<_> = hw
@@ -308,7 +325,7 @@ pub fn print_json(
         })
         .collect();
 
-    let out = serde_json::json!({
+    serde_json::json!({
         "hardware": {
             "gpus": gpus,
             "ram_gb": format!("{:.1}", hw.ram_bytes as f64 / GIB),
@@ -316,16 +333,5 @@ pub fn print_json(
             "os": hw.os.to_string(),
         },
         "models": models,
-    });
-
-    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
-}
-
-fn fit_type_str(fit: &FitType) -> &'static str {
-    match fit {
-        FitType::FullGpu => "full_gpu",
-        FitType::PartialOffload { .. } => "partial_offload",
-        FitType::CpuOnly => "cpu_only",
-        FitType::TooBig => "too_big",
-    }
+    })
 }

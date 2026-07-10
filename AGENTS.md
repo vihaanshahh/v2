@@ -1,8 +1,11 @@
 # AGENTS.md
 
-Scope: the whole `v2` repo. This is a single Rust CLI binary — no web frontend, no
-hosted server. `v2 serve` presents an interactive terminal control panel (line-based,
-no extra deps); `--headless` keeps the old blocking proxy for systemd/daemons.
+Scope: the whole `v2` repo. The core is a single Rust CLI binary — no hosted server.
+`v2 serve` presents an interactive terminal control panel (line-based, no extra deps);
+`--headless` keeps the old blocking proxy for systemd/daemons. `desktop/` adds an
+optional native desktop app (Tauri) that reuses the `web/` UI and calls the `v2` lib
+crate in-process — no HTTP, no subprocess. It's a separate consumer of the same core;
+the CLI's own `serve` panel remains terminal-only and unaffected.
 
 ## What v2 does
 
@@ -22,6 +25,7 @@ the mesh only ever talks to v2. No Docker, no hosted coordination server — one
 
 | Path | Role |
 |------|------|
+| `src/lib.rs` | `v2` as a library — re-exports every module below as `pub mod` so `main.rs` and `desktop/src-tauri` can both consume them; the module list here mirrors `main.rs`'s old `mod` block exactly, including the `#[cfg(feature = "daemon")]` gates |
 | `src/main.rs` | CLI (clap), command dispatch |
 | `src/hardware.rs` | GPU/RAM/CPU detection (nvidia-smi, sysctl, /proc, wmic) |
 | `src/models.rs` | `Model`, `Quant`, static catalog, param parsing |
@@ -57,8 +61,22 @@ Daemon feature (`--features daemon`, default on; excluded by `--no-default-featu
 | `.github/workflows/release.yml` | Cross-platform release builds on tag push |
 | `Makefile` | `make check`, `make build`, `make package` |
 
+Desktop app (native GUI, optional, separate from the CLI's own H6 boundary):
+
+| Path | Role |
+|------|------|
+| `web/` | Vite + TypeScript frontend, four tabs: Scan (hardware/model fit), Models (pull/chat/remove, `views/models.ts`), Serve (proxy start/stop, usage, doctor, endpoint banner, `views/serve.ts`), Mesh (init/invite/join/peers/pause/resume/federation, `views/mesh.ts`). `web/src/platform.ts` calls `invoke()`/`listen()` when running inside Tauri; outside Tauri only Scan works (falls back to `fetch('/api/scan')`, the dev-server-only subprocess shim in `web/vite.config.ts`) — other tabs are disabled in the nav |
+| `desktop/src-tauri/src/commands/` | `scan.rs`, `models.rs`, `serve.rs`, `mesh.rs` — one `#[tauri::command]` per CLI capability, each calling straight into the `v2` lib crate (daemon feature on) — no HTTP, no subprocess. `serve.rs` owns `ProxyState` (a `Mutex<Option<JoinHandle>>`) so start/stop work from the GUI without killing the app |
+
 The scan path (`main` → `hardware`/`models`/`engine`/`bandwidth`/`display`) must stay
 free of mesh/daemon imports so `--no-default-features` builds the CLI alone (H6).
+`desktop/src-tauri` depending on `v2` with daemon on does not affect this — H6 only
+constrains the plain CLI's `--no-default-features` build, which nothing here changes.
+
+Known gap: chat-over-mesh (`v2 mesh run <model> <prompt>`, streaming through a
+peer's Noise channel with receipt co-signing) is not yet wired into the desktop
+app — the Mesh tab covers org admin (init/invite/join/peers/pause/resume/
+federation) but not remote inference. Still CLI-only; a fast-follow if wanted.
 Do not edit `target/` or `dist/`. Commit `Cargo.lock` (application crate).
 
 ## Commands (for agents)

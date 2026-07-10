@@ -318,3 +318,18 @@ Setup story, in full:
 - **Owner sharing a machine:** `curl … | bash` → `v2 mesh join <ticket>` → `v2 serve`.
 - **Teammate using the mesh:** `curl … | bash` → `v2 mesh join <ticket>` → `v2 run --mesh qwen3:32b`.
 - **Admin:** the above plus `v2 mesh init` once and `v2 mesh invite` per person.
+
+---
+
+## 13. Desktop app (native GUI, thin shell over this same design)
+
+`desktop/src-tauri` is a Tauri app that calls the `v2` lib crate (`src/lib.rs`) directly
+— in-process, no HTTP, no subprocess. It is a second *caller* of the exact code paths
+described above, not a new architecture: every `#[tauri::command]` wraps an existing
+CLI operation's underlying logic (refactored into a data-returning function alongside
+its existing `println!`-based CLI wrapper, e.g. `display::scan_json` /
+`display::print_json`). Because it's the same code, **every invariant and harness in
+this document (I1–I5, H1–H6) applies unchanged** — the desktop app gains no special
+trust, no bypass of admission/reclaim/quarantine, and no new failure mode. It ships in
+phases (scan → model management → serve/usage/doctor → mesh), each phase reusing the
+matching CLI module rather than reimplementing its logic in the Tauri layer.

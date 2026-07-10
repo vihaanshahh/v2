@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Runs before `git push`. Enable once per clone with:
+#   git config core.hooksPath .githooks
+#
+# Mirrors `make check` plus the desktop app's build surface (Tauri crate +
+# frontend typecheck), so a push can't land a broken lib/bin split, a broken
+# `--no-default-features` CLI-only build (H6), or a desktop crate that no
+# longer compiles against the lib. Does NOT run a full `tauri build` (slow,
+# needs system webview deps) — that's `make desktop-build`, run manually.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+echo "==> cargo test"
+cargo test
+
+echo "==> cargo build --release"
+cargo build --release
+
+echo "==> cargo check --no-default-features (H6: CLI must build with daemon/mesh off)"
+cargo check --no-default-features
+
+if [ -d desktop/src-tauri ]; then
+  echo "==> cargo check (desktop/src-tauri)"
+  (cd desktop/src-tauri && cargo check)
+fi
+
+if [ -d web ] && [ -f web/package.json ]; then
+  echo "==> tsc --noEmit (web/)"
+  (cd web && npx tsc --noEmit)
+fi
+
+echo "pre-push checks passed."

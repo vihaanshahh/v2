@@ -8,7 +8,7 @@
 //! written from the reader's Drop, so partial usage is never lost.
 
 use std::io::Read;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -127,9 +127,17 @@ fn require_bearer(request: &tiny_http::Request, auth: &AuthMode) -> bool {
 
 /// Print a paste-ready description of the OpenAI-compatible endpoint: the Base
 /// URL(s), the API key, and installed model ids. `V2_PUBLIC_URL` (if set) is
-/// shown as the primary Base URL so a reverse-proxied/tunnelled deployment
-/// advertises its real address. Callable standalone via `v2 endpoint`.
-pub fn print_endpoint_banner(listen: &str, ollama_host: &str, reveal_key: bool) -> Result<(), String> {
+/// Pure data behind the endpoint banner — shared by `v2 endpoint`/`v2 serve`'s
+/// printed panel and the desktop app's endpoint info command.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EndpointInfo {
+    pub base_url: String,
+    pub local_url: Option<String>,
+    pub api_key: String,
+    pub models: Vec<String>,
+}
+
+pub fn endpoint_info(listen: &str, ollama_host: &str, reveal_key: bool) -> Result<EndpointInfo, String> {
     // Public URL: env wins, then the `[endpoint] public_url` config.
     let cfg = endpoint_cfg()?;
     let public = match public_url_raw(&cfg) {
@@ -146,17 +154,33 @@ pub fn print_endpoint_banner(listen: &str, ollama_host: &str, reveal_key: bool) 
         models.extend(endpoints::aliases(&ep));
     }
 
-    let mut rows: Vec<(String, String)> = Vec::new();
-    if let Some(p) = &public {
-        rows.push(("Base URL".into(), format!("{p}/v1")));
-        rows.push(("(local)".into(), format!("{}/v1", local_base_url(listen))));
-    } else {
-        rows.push(("Base URL".into(), format!("{}/v1", local_base_url(listen))));
+    let (base_url, local_url) = match &public {
+        Some(p) => (format!("{p}/v1"), Some(format!("{}/v1", local_base_url(listen)))),
+        None => (format!("{}/v1", local_base_url(listen)), None),
+    };
+
+    Ok(EndpointInfo {
+        base_url,
+        local_url,
+        api_key: auth_description(&auth, reveal_key),
+        models,
+    })
+}
+
+/// Rendered from `endpoint_info` — the primary Base URL is the public one when
+/// a reverse-proxied/tunnelled deployment advertises one. Callable standalone
+/// via `v2 endpoint`.
+pub fn print_endpoint_banner(listen: &str, ollama_host: &str, reveal_key: bool) -> Result<(), String> {
+    let info = endpoint_info(listen, ollama_host, reveal_key)?;
+
+    let mut rows: Vec<(String, String)> = vec![("Base URL".into(), info.base_url)];
+    if let Some(local) = info.local_url {
+        rows.push(("(local)".into(), local));
     }
-    rows.push(("API key".into(), auth_description(&auth, reveal_key)));
+    rows.push(("API key".into(), info.api_key));
     rows.push((
         "Models".into(),
-        if models.is_empty() { "(none installed — run `v2 pull <model>`)".into() } else { models.join(", ") },
+        if info.models.is_empty() { "(none installed — run `v2 pull <model>`)".into() } else { info.models.join(", ") },
     ));
     crate::ui::panel("OpenAI-compatible endpoint", &rows);
     println!("  Point any OpenAI tool here: Base URL + API key + a Model ID.");
@@ -209,6 +233,22 @@ const MAX_ERROR_BODY: u64 = 1024 * 1024;
 
 /// Run the metering proxy until the process is stopped. Blocks.
 pub fn serve(listen: &str, ollama_host: &str, activity: Activity, cpu_limit: CpuLimit) -> Result<(), String> {
+    // Never flipped, so this behaves exactly like the old unconditional loop —
+    // the only way to stop is killing the process (deadman by design).
+    serve_with_shutdown(listen, ollama_host, activity, cpu_limit, Arc::new(AtomicBool::new(true)))
+}
+
+/// Same as `serve`, but polls `running` between requests so a caller — e.g. the
+/// desktop app's "stop serving" button — can end the loop in-process without
+/// killing the whole app. Doesn't touch the mesh deadman path (DESIGN.md §4):
+/// in-flight mesh connections still only die on disconnect/timeout, unaffected.
+pub fn serve_with_shutdown(
+    listen: &str,
+    ollama_host: &str,
+    activity: Activity,
+    cpu_limit: CpuLimit,
+    running: Arc<AtomicBool>,
+) -> Result<(), String> {
     let auth = auth_mode(listen)?;
     let protect_all = protect_all_paths(listen)?;
     let server = tiny_http::Server::http(listen)
@@ -218,18 +258,24 @@ pub fn serve(listen: &str, ollama_host: &str, activity: Activity, cpu_limit: Cpu
     println!("v2 proxy  {listen} -> {ollama_host}  (metering local usage)");
     print_endpoint_banner(listen, &ollama_host, false)?;
 
-    for request in server.incoming_requests() {
-        let host = ollama_host.clone();
-        let act = activity.clone();
-        let auth = auth.clone();
-        // Snapshot the cap per request so panel changes take effect immediately.
-        let threads = cpu_limit.load(Ordering::Relaxed);
-        // Thread per request: concurrent local apps, blocking I/O, no async.
-        std::thread::spawn(move || {
-            if let Err(e) = handle(request, &host, &act, threads, &auth, protect_all) {
-                eprintln!("v2 proxy: {e}");
+    while running.load(Ordering::Relaxed) {
+        match server.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(Some(request)) => {
+                let host = ollama_host.clone();
+                let act = activity.clone();
+                let auth = auth.clone();
+                // Snapshot the cap per request so panel changes take effect immediately.
+                let threads = cpu_limit.load(Ordering::Relaxed);
+                // Thread per request: concurrent local apps, blocking I/O, no async.
+                std::thread::spawn(move || {
+                    if let Err(e) = handle(request, &host, &act, threads, &auth, protect_all) {
+                        eprintln!("v2 proxy: {e}");
+                    }
+                });
             }
-        });
+            Ok(None) => continue, // timed out — loop back around to re-check `running`
+            Err(e) => return Err(format!("proxy accept error: {e}")),
+        }
     }
     Ok(())
 }
@@ -706,5 +752,41 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(r.last_stats.as_ref().unwrap().eval_count, 42);
+    }
+
+    /// The desktop app's "stop serving" button relies on `serve_with_shutdown`
+    /// actually exiting once `running` flips — not just on process kill (the old
+    /// deadman-only story). Binds an OS-assigned port so this can't collide with
+    /// a real `v2 serve` on the test machine.
+    #[test]
+    fn serve_with_shutdown_stops_once_flag_flips() {
+        let _g = crate::test_support::lock();
+        crate::test_support::set_temp_home("proxy");
+
+        let running = Arc::new(AtomicBool::new(true));
+        let running2 = running.clone();
+        let cpu_limit: CpuLimit = Arc::new(AtomicUsize::new(0));
+        let activity = Activity::new();
+
+        let handle = std::thread::spawn(move || {
+            serve_with_shutdown("127.0.0.1:0", "http://127.0.0.1:11434", activity, cpu_limit, running2)
+        });
+
+        // Let it bind and enter the poll loop, then ask it to stop.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        running.store(false, Ordering::Relaxed);
+
+        // Bound the wait: if the shutdown flag were ignored, `join()` would hang
+        // forever and this test would time out the whole suite instead of failing
+        // cleanly, so hand the join off to a watchdog thread with a real deadline.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(handle.join());
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("serve_with_shutdown did not stop within 3s of the flag flipping")
+            .expect("proxy thread panicked");
+        assert!(result.is_ok(), "serve_with_shutdown returned an error: {result:?}");
     }
 }

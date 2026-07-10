@@ -1,41 +1,11 @@
-mod accepted;
-mod bandwidth;
-mod display;
-mod engine;
-mod hardware;
-mod models;
-mod ollama;
-mod sources;
-mod ui;
-
-#[cfg(feature = "daemon")]
-mod activity;
-#[cfg(feature = "daemon")]
-mod console;
-#[cfg(feature = "daemon")]
-mod endpoints;
-#[cfg(feature = "daemon")]
-mod manage;
-#[cfg(feature = "daemon")]
-mod mesh;
-#[cfg(feature = "daemon")]
-mod ollama_api;
-#[cfg(feature = "daemon")]
-mod paths;
-#[cfg(feature = "daemon")]
-mod policy;
-#[cfg(feature = "daemon")]
-mod proxy;
-#[cfg(feature = "daemon")]
-mod usage;
-
 #[cfg(feature = "daemon")]
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use models::Quant;
-use sources::{LoadOptions, ModelSource};
+use v2::*;
+use v2::models::Quant;
+use v2::sources::{LoadOptions, ModelSource};
 
 #[derive(Parser)]
 #[command(
@@ -459,71 +429,25 @@ fn run_mesh(cmd: MeshCmd, hw: &hardware::HardwareInfo, ctx: u32) -> Result<(), S
 /// One badged line per subsystem: Ollama, identity, membership, policy.
 #[cfg(feature = "daemon")]
 fn doctor(host: &str, _hw: &hardware::HardwareInfo) {
+    use doctor::Status;
     use ui::Badge;
     ui::section("doctor");
 
-    let line = |b: Badge, label: &str, msg: String| {
+    let line = |status: Status, label: &str, msg: &str| {
+        let b = match status {
+            Status::Ok => Badge::Ok,
+            Status::Warn => Badge::Warn,
+            Status::Bad => Badge::Bad,
+        };
         println!("  {}  {}  {}", ui::badge(b), ui::pad(label, 9), msg);
     };
 
-    match ollama::fetch_local(host) {
-        Ok(models) => line(Badge::Ok, "ollama", format!("reachable at {host} · {} models", models.len())),
-        Err(e) => line(Badge::Bad, "ollama", format!("{e}\n              start it with `ollama serve`")),
-    }
-
-    match mesh::identity::NodeKey::load_or_create() {
-        Ok(node) => line(Badge::Ok, "identity", format!("node {}", mesh::short_id(&node.public_b64()))),
-        Err(e) => line(Badge::Bad, "identity", e),
-    }
-
-    match mesh::identity::MeshIdentity::load() {
-        Ok(Some(ident)) => {
-            let now = usage::now_unix();
-            match ident.org_pub_bytes().and_then(|org| ident.cert.verify(&org, now)) {
-                Ok(()) => {
-                    let h = ident.cert.expiry.saturating_sub(now) / 3600;
-                    line(Badge::Ok, "mesh", format!("member of org {} · cert valid {h}h", mesh::short_id(&ident.org_pub)));
-                }
-                Err(e) => line(Badge::Warn, "mesh", format!("membership cert problem: {e}")),
-            }
-        }
-        Ok(None) => line(Badge::Warn, "mesh", "not a member (run `v2 mesh init` or `v2 mesh join`)".into()),
-        Err(e) => line(Badge::Warn, "mesh", e),
-    }
-
-    match policy::Policy::load() {
-        Ok(p) => {
-            line(
-                Badge::Ok,
-                "policy",
-                format!(
-                    "{} remote job · {:.0}% VRAM cap · yield_to_local={}",
-                    p.serve.max_concurrent_remote,
-                    p.serve.max_vram_fraction * 100.0,
-                    p.availability.yield_to_local
-                ),
-            );
-            let a = &p.abuse;
-            let lists = if !a.deny_nodes.is_empty() || !a.only_nodes.is_empty() {
-                format!(" · {} deny / {} allow", a.deny_nodes.len(), a.only_nodes.len())
-            } else {
-                String::new()
-            };
-            line(
-                Badge::Ok,
-                "abuse",
-                format!(
-                    "{}/min per IP · {} conns ({}/IP) · ban after {} strikes{}",
-                    a.handshake_rate_per_min,
-                    a.max_connections,
-                    a.max_connections_per_ip,
-                    a.strike_limit,
-                    lists,
-                ),
-            );
-        }
-        Err(e) => line(Badge::Bad, "policy", format!("{e} (serving will refuse to start)")),
-    }
+    let report = doctor::doctor_report(host);
+    line(report.ollama.status, &report.ollama.label, &report.ollama.message);
+    line(report.identity.status, &report.identity.label, &report.identity.message);
+    line(report.mesh.status, &report.mesh.label, &report.mesh.message);
+    line(report.policy.status, &report.policy.label, &report.policy.message);
+    line(report.abuse.status, &report.abuse.label, &report.abuse.message);
     println!();
 }
 

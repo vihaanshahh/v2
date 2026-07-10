@@ -96,7 +96,7 @@ pub fn day_to_date(ts: u64) -> String {
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Agg {
     tokens_in: u64,
     tokens_out: u64,
@@ -104,23 +104,48 @@ struct Agg {
     duration_ms: u64,
 }
 
-/// Print a compact usage summary grouped by day, then model, then source.
-pub fn print_summary(records: &[UsageRecord], json: bool) {
-    if json {
-        let arr: Vec<_> = records
-            .iter()
-            .map(|r| serde_json::to_value(r).unwrap_or_default())
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
-        return;
-    }
+/// One grouped row (a day, a model, or a source) — pure data shared by the
+/// CLI's printed table and the desktop app's usage panel.
+#[derive(Debug, Clone, Serialize)]
+pub struct AggRow {
+    pub key: String,
+    pub requests: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub tps: f64,
+}
 
-    if records.is_empty() {
-        crate::ui::section("usage");
-        println!("  no records yet — run `v2 serve` and route apps through :11435 to meter");
-        return;
-    }
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageSummary {
+    pub total_requests: u64,
+    pub total_tokens_in: u64,
+    pub total_tokens_out: u64,
+    pub by_day: Vec<AggRow>,
+    pub by_model: Vec<AggRow>,
+    pub by_source: Vec<AggRow>,
+}
 
+fn agg_rows<I: Iterator<Item = (String, Agg)>>(rows: I) -> Vec<AggRow> {
+    let mut rows: Vec<_> = rows.collect();
+    rows.sort_by(|a, b| (b.1.tokens_out).cmp(&a.1.tokens_out));
+    rows.into_iter()
+        .take(12)
+        .map(|(key, a)| AggRow {
+            key,
+            requests: a.requests,
+            tokens_in: a.tokens_in,
+            tokens_out: a.tokens_out,
+            tps: if a.duration_ms > 0 {
+                a.tokens_out as f64 / (a.duration_ms as f64 / 1000.0)
+            } else {
+                0.0
+            },
+        })
+        .collect()
+}
+
+/// Group records by day/model/source — no I/O, no printing.
+pub fn summarize(records: &[UsageRecord]) -> UsageSummary {
     let mut by_day: BTreeMap<u64, Agg> = BTreeMap::new();
     let mut by_model: BTreeMap<String, Agg> = BTreeMap::new();
     let mut by_source: BTreeMap<String, Agg> = BTreeMap::new();
@@ -149,37 +174,59 @@ pub fn print_summary(records: &[UsageRecord], json: bool) {
         total.duration_ms += r.duration_ms;
     }
 
+    UsageSummary {
+        total_requests: total.requests,
+        total_tokens_in: total.tokens_in,
+        total_tokens_out: total.tokens_out,
+        by_day: agg_rows(by_day.into_iter().map(|(d, a)| (day_to_date(d * 86_400), a))),
+        by_model: agg_rows(by_model.into_iter()),
+        by_source: agg_rows(by_source.into_iter()),
+    }
+}
+
+/// Print a compact usage summary grouped by day, then model, then source.
+pub fn print_summary(records: &[UsageRecord], json: bool) {
+    if json {
+        let arr: Vec<_> = records
+            .iter()
+            .map(|r| serde_json::to_value(r).unwrap_or_default())
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+        return;
+    }
+
+    if records.is_empty() {
+        crate::ui::section("usage");
+        println!("  no records yet — run `v2 serve` and route apps through :11435 to meter");
+        return;
+    }
+
+    let summary = summarize(records);
+
     crate::ui::panel(
         "usage",
         &[
-            ("requests".into(), total.requests.to_string()),
-            ("tokens in".into(), fmt_tokens(total.tokens_in)),
-            ("tokens out".into(), fmt_tokens(total.tokens_out)),
+            ("requests".into(), summary.total_requests.to_string()),
+            ("tokens in".into(), fmt_tokens(summary.total_tokens_in)),
+            ("tokens out".into(), fmt_tokens(summary.total_tokens_out)),
         ],
     );
 
-    print_group("by day", by_day.into_iter().map(|(d, a)| (day_to_date(d * 86_400), a)));
-    print_group("by model", by_model.into_iter());
-    print_group("by source", by_source.into_iter());
+    print_group("by day", &summary.by_day);
+    print_group("by model", &summary.by_model);
+    print_group("by source", &summary.by_source);
 }
 
-fn print_group<I: Iterator<Item = (String, Agg)>>(title: &str, rows: I) {
+fn print_group(title: &str, rows: &[AggRow]) {
     crate::ui::section(title);
-    let mut rows: Vec<_> = rows.collect();
-    rows.sort_by(|a, b| (b.1.tokens_out).cmp(&a.1.tokens_out));
-    for (k, a) in rows.into_iter().take(12) {
-        let tps = if a.duration_ms > 0 {
-            a.tokens_out as f64 / (a.duration_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
+    for row in rows {
         println!(
             "    {:<20}  {:>4} req  {:>8} in  {:>8} out  {:>6.0} tok/s",
-            k,
-            a.requests,
-            fmt_tokens(a.tokens_in),
-            fmt_tokens(a.tokens_out),
-            tps,
+            row.key,
+            row.requests,
+            fmt_tokens(row.tokens_in),
+            fmt_tokens(row.tokens_out),
+            row.tps,
         );
     }
 }
@@ -216,5 +263,53 @@ mod tests {
         let torn = &line[..line.len() / 2];
         assert!(serde_json::from_str::<UsageRecord>(torn).is_err());
         assert!(serde_json::from_str::<UsageRecord>(&line).is_ok());
+    }
+
+    fn rec(ts: u64, source: &str, model: &str, tokens_in: u64, tokens_out: u64, duration_ms: u64) -> UsageRecord {
+        UsageRecord { ts, source: source.into(), kind: "served".into(), model: model.into(), tokens_in, tokens_out, duration_ms }
+    }
+
+    // `summarize` is the data function behind both `v2 usage` and the desktop
+    // app's usage panel — this is the "API test" for that shared surface.
+    #[test]
+    fn summarize_totals_and_groups_match_input() {
+        let records = vec![
+            rec(0, "local", "qwen3:8b", 10, 100, 1000),
+            rec(1, "local", "qwen3:8b", 5, 50, 500),
+            rec(86_400, "peer-a", "llama3.1", 20, 200, 2000),
+        ];
+
+        let s = summarize(&records);
+
+        assert_eq!(s.total_requests, 3);
+        assert_eq!(s.total_tokens_in, 35);
+        assert_eq!(s.total_tokens_out, 350);
+
+        // Two distinct days.
+        assert_eq!(s.by_day.len(), 2);
+        assert_eq!(s.by_day.iter().map(|r| r.requests).sum::<u64>(), 3);
+
+        // by_model is sorted by tokens_out desc: llama3.1 (200) before qwen3:8b (150 combined).
+        assert_eq!(s.by_model[0].key, "llama3.1");
+        assert_eq!(s.by_model[0].tokens_out, 200);
+        assert_eq!(s.by_model[1].key, "qwen3:8b");
+        assert_eq!(s.by_model[1].requests, 2);
+        assert_eq!(s.by_model[1].tokens_out, 150);
+
+        assert_eq!(s.by_source.len(), 2);
+        let local = s.by_source.iter().find(|r| r.key == "local").unwrap();
+        assert_eq!(local.requests, 2);
+        assert_eq!(local.tokens_out, 150);
+        // tps = tokens_out / (duration_ms / 1000) summed: 150 tok / 1.5s = 100 tok/s.
+        assert!((local.tps - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn summarize_empty_is_all_zero() {
+        let s = summarize(&[]);
+        assert_eq!(s.total_requests, 0);
+        assert!(s.by_day.is_empty());
+        assert!(s.by_model.is_empty());
+        assert!(s.by_source.is_empty());
     }
 }

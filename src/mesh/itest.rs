@@ -21,19 +21,7 @@ use super::proto::{CoSign, EnrollResponse, Frame, Request};
 use super::serve::{self, ServeCtx};
 use super::transport;
 
-// These tests each point the process-global HOME at a temp dir, so they must not
-// run concurrently. This lock serialises them.
-static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-fn lock() -> std::sync::MutexGuard<'static, ()> {
-    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn set_temp_home() {
-    let dir = std::env::temp_dir().join(format!("v2-itest-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::env::set_var("HOME", &dir);
-}
+use crate::test_support::{lock, set_temp_home};
 
 /// A mock Ollama that streams tokens *slowly* (a delay per read), so a test can
 /// reclaim the job mid-generation.
@@ -139,7 +127,7 @@ fn test_hw() -> HardwareInfo {
 #[test]
 fn mesh_end_to_end() {
     let _g = lock();
-    set_temp_home();
+    set_temp_home("itest");
 
     // Org + an admin node (admin can both enroll members and serve inference).
     let org = OrgRoot::from_seed([1u8; 32]);
@@ -267,7 +255,7 @@ fn mesh_end_to_end() {
 #[test]
 fn preemption_terminates_inflight() {
     let _g = lock();
-    set_temp_home();
+    set_temp_home("itest");
 
     let org = OrgRoot::from_seed([4u8; 32]);
     let org_pub = org.public_bytes();

@@ -176,6 +176,17 @@ fn compute_memory_pools(hw: &HardwareInfo, notes: &mut Vec<String>) -> (u64, u64
     (usable_vram, usable_ram)
 }
 
+/// Stable machine-readable tag for a fit outcome — shared by CLI `--json` and
+/// the desktop app so both surfaces agree on one vocabulary.
+pub fn fit_type_str(fit: &FitType) -> &'static str {
+    match fit {
+        FitType::FullGpu => "full_gpu",
+        FitType::PartialOffload { .. } => "partial_offload",
+        FitType::CpuOnly => "cpu_only",
+        FitType::TooBig => "too_big",
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// For a given model, find the best (highest quality) quant that fits fully in GPU.

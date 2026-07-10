@@ -2,6 +2,7 @@
 //! admin/member CLI operations. Outbound connections only.
 
 use colored::Colorize;
+use serde::Serialize;
 
 use crate::hardware::HardwareInfo;
 
@@ -27,7 +28,9 @@ pub fn init() -> Result<(), String> {
     Ok(())
 }
 
-pub fn invite(addr: Option<&str>, via_relay: Option<&str>, ttl_secs: u64) -> Result<(), String> {
+/// Mint the ticket string only — no printing, reusable by the desktop app's
+/// invite dialog.
+pub fn invite_ticket(addr: Option<&str>, via_relay: Option<&str>, ttl_secs: u64) -> Result<String, String> {
     let org = OrgRoot::load()?;
     // A relay route hides your IP: the ticket carries relay://<relay>/<node-id>
     // instead of a raw address. Requires this node to be registered at that relay
@@ -41,8 +44,13 @@ pub fn invite(addr: Option<&str>, via_relay: Option<&str>, ttl_secs: u64) -> Res
         (None, None) => return Err("provide an address or --via-relay <relay-addr>".into()),
     };
     let ticket = org.make_ticket(&target, ttl_secs)?;
+    Ok(ticket.encode())
+}
+
+pub fn invite(addr: Option<&str>, via_relay: Option<&str>, ttl_secs: u64) -> Result<(), String> {
+    let encoded = invite_ticket(addr, via_relay, ttl_secs)?;
     println!("{}", "one-time invite ticket (expires in {}h):".replace("{}", &(ttl_secs / 3600).to_string()));
-    println!("\n{}\n", ticket.encode());
+    println!("\n{}\n", encoded);
     if via_relay.is_some() {
         println!("Reachable via relay (your IP stays hidden). Keep `v2 serve --relay …` running.");
     }
@@ -132,7 +140,20 @@ pub fn join(ticket_str: &str) -> Result<(), String> {
 
 // ── Status / peers ───────────────────────────────────────────────────────────
 
-pub fn status() -> Result<(), String> {
+/// Pure snapshot of this node's mesh state — no printing, reusable by the
+/// desktop app's Mesh tab.
+#[derive(Debug, Clone, Serialize)]
+pub struct MeshStatus {
+    pub node_id: String,
+    pub is_member: bool,
+    pub org_id: Option<String>,
+    pub role: Option<String>,
+    pub cert_valid_hours: Option<u64>,
+    pub connected_peers: usize,
+    pub known_peer_addrs: Vec<String>,
+}
+
+pub fn status_data() -> Result<MeshStatus, String> {
     let node = NodeKey::load_or_create()?;
     let peers = PeersFile::load();
     let ident = MeshIdentity::load()?;
@@ -141,27 +162,50 @@ pub fn status() -> Result<(), String> {
     } else {
         0
     };
-    let mut rows = vec![("node".to_string(), short_id(&node.public_b64()))];
-    match ident {
-        None => rows.push((
-            "member".into(),
-            format!("{}  — run `v2 mesh init` or `v2 mesh join`", "no".yellow()),
-        )),
+    let (org_id, role, cert_valid_hours) = match &ident {
+        None => (None, None, None),
         Some(ident) => {
             let remaining = ident.cert.expiry.saturating_sub(now_unix()) / 3600;
             let admin = OrgRoot::load().is_ok();
-            rows.push(("org".into(), short_id(&ident.org_pub)));
-            rows.push(("role".into(), if admin { "admin".green().to_string() } else { "member".to_string() }));
-            rows.push(("cert".into(), format!("valid {remaining}h")));
+            (
+                Some(short_id(&ident.org_pub)),
+                Some(if admin { "admin" } else { "member" }.to_string()),
+                Some(remaining),
+            )
         }
+    };
+    Ok(MeshStatus {
+        node_id: short_id(&node.public_b64()),
+        is_member: ident.is_some(),
+        org_id,
+        role,
+        cert_valid_hours,
+        connected_peers: connected,
+        known_peer_addrs: peers.peers.into_iter().map(|p| p.addr).collect(),
+    })
+}
+
+pub fn status() -> Result<(), String> {
+    let s = status_data()?;
+    let mut rows = vec![("node".to_string(), s.node_id)];
+    match (&s.org_id, &s.role, s.cert_valid_hours) {
+        (Some(org), Some(role), Some(hours)) => {
+            rows.push(("org".into(), org.clone()));
+            rows.push(("role".into(), if role == "admin" { "admin".green().to_string() } else { "member".to_string() }));
+            rows.push(("cert".into(), format!("valid {hours}h")));
+        }
+        _ => rows.push((
+            "member".into(),
+            format!("{}  — run `v2 mesh init` or `v2 mesh join`", "no".yellow()),
+        )),
     }
     rows.push((
         "peers".into(),
-        format!("{connected} connected / {} known", peers.peers.len()),
+        format!("{} connected / {} known", s.connected_peers, s.known_peer_addrs.len()),
     ));
     crate::ui::panel("mesh status", &rows);
-    for p in peers.peers {
-        println!("  · {}", p.addr.dimmed());
+    for addr in s.known_peer_addrs {
+        println!("  · {}", addr.dimmed());
     }
     Ok(())
 }
@@ -174,15 +218,27 @@ pub fn peer_add(addr: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// One reachable peer's address + self-reported card — pure data, reusable by
+/// the desktop app's peer roster.
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerCard {
+    pub addr: String,
+    pub card: NodeCard,
+}
+
+pub fn peers_data() -> Result<Vec<PeerCard>, String> {
+    Ok(collect_cards()?.into_iter().map(|(addr, card)| PeerCard { addr, card }).collect())
+}
+
 /// Fetch and print each peer's node card (pull-based discovery).
 pub fn peers() -> Result<(), String> {
-    let cards = collect_cards()?;
+    let cards = peers_data()?;
     if cards.is_empty() {
         println!("v2 mesh peers  none reachable  (add with `v2 mesh peer add host:port`)");
         return Ok(());
     }
     crate::ui::section(&format!("mesh peers  ({} reachable)", cards.len()));
-    for (addr, card) in &cards {
+    for PeerCard { addr, card } in &cards {
         let model_count = card.models.len() + card.remote_models.len();
         println!(
             "  {:<22} {:<10} {:>5.0}G  {:>4.0} GB/s  {}/{} busy  {} models",

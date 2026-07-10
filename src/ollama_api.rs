@@ -3,10 +3,10 @@
 
 use std::io::{BufRead, BufReader, Read};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// One running model as reported by `GET /api/ps`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunningModel {
     pub name: String,
     #[serde(default)]
