@@ -1,0 +1,52 @@
+name: Build Desktop App
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: Build macOS app (universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            desktop/src-tauri
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install web frontend deps
+        run: npm ci
+        working-directory: web
+
+      - name: Build web frontend
+        run: npm run build
+        working-directory: web
+
+      - name: Install desktop (Tauri CLI) deps
+        run: npm ci
+        working-directory: desktop
+
+      - name: Build macOS app (universal binary, unsigned)
+        run: npx tauri build --target universal-apple-darwin
+        working-directory: desktop
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v2-desktop-macos
+          path: |
+            desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
+          if-no-files-found: error
