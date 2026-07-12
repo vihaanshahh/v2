@@ -73,10 +73,9 @@ free of mesh/daemon imports so `--no-default-features` builds the CLI alone (H6)
 `desktop/src-tauri` depending on `v2` with daemon on does not affect this — H6 only
 constrains the plain CLI's `--no-default-features` build, which nothing here changes.
 
-Known gap: chat-over-mesh (`v2 mesh run <model> <prompt>`, streaming through a
-peer's Noise channel with receipt co-signing) is not yet wired into the desktop
-app — the Mesh tab covers org admin (init/invite/join/peers/pause/resume/
-federation) but not remote inference. Still CLI-only; a fast-follow if wanted.
+Known gap: deep links (`v2://join/...`), QR invites, signed installers/updater,
+and richer usage charts are still aspirational for the desktop shell. Mesh remote
+chat is wired in the Models tab (local, peer, and hosted endpoint routes).
 Do not edit `target/` or `dist/`. Commit `Cargo.lock` (application crate).
 
 ## Commands (for agents)

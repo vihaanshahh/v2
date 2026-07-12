@@ -1,6 +1,8 @@
 import type {
   ChatMessage,
   ChatReply,
+  ChatRoute,
+  ChatTarget,
   DoctorReport,
   EndpointInfo,
   FederatedOrg,
@@ -74,6 +76,12 @@ export const modelStop = (model: string, host?: string) =>
 
 export const modelChat = (model: string, messages: ChatMessage[], host?: string) =>
   invoke<ChatReply>("model_chat", { model, messages, host: host ?? null });
+
+export const chatTargets = (ctx: number, host?: string) =>
+  invoke<ChatTarget[]>("chat_targets", { ctx, host: host ?? null });
+
+export const chatSend = (route: ChatRoute, messages: ChatMessage[], ctx: number) =>
+  invoke<ChatReply>("chat_send", { route, messages, ctx });
 
 export const onPullProgress = (cb: (p: PullProgress) => void) => on<PullProgress>("pull-progress", cb);
 

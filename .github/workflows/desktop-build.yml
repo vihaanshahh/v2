@@ -1,21 +1,85 @@
 name: Build Desktop App
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/desktop-build.yml"
+      - "desktop/**"
+      - "web/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/desktop-build.yml"
+      - "desktop/**"
+      - "web/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: desktop-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  macos:
-    name: Build macOS app (universal)
-    runs-on: macos-latest
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            name: Linux x64
+            args: ""
+            artifact: v2-desktop-linux-x64
+            bundle_glob: |
+              desktop/src-tauri/target/release/bundle/deb/*.deb
+              desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+          - os: macos-latest
+            name: macOS universal
+            args: --target universal-apple-darwin
+            artifact: v2-desktop-macos
+            bundle_glob: |
+              desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+              desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
+          - os: windows-latest
+            name: Windows x64
+            args: ""
+            artifact: v2-desktop-windows-x64
+            bundle_glob: |
+              desktop/src-tauri/target/release/bundle/nsis/*.exe
+              desktop/src-tauri/target/release/bundle/msi/*.msi
+
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-apple-darwin,aarch64-apple-darwin
+          targets: ${{ matrix.os == 'macos-latest' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -26,27 +90,27 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            desktop/package-lock.json
 
-      - name: Install web frontend deps
-        run: npm ci
-        working-directory: web
-
-      - name: Build web frontend
-        run: npm run build
+      - name: Install and build web frontend
+        run: |
+          npm ci
+          npm run build
         working-directory: web
 
       - name: Install desktop (Tauri CLI) deps
         run: npm ci
         working-directory: desktop
 
-      - name: Build macOS app (universal binary, unsigned)
-        run: npx tauri build --target universal-apple-darwin
+      - name: Build desktop app
+        run: npx tauri build ${{ matrix.args }}
         working-directory: desktop
 
       - uses: actions/upload-artifact@v4
         with:
-          name: v2-desktop-macos
-          path: |
-            desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
-            desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.bundle_glob }}
           if-no-files-found: error

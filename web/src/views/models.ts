@@ -1,7 +1,8 @@
-import type { ChatMessage, FitCheck, InstalledModel, PullProgress, RunningModel } from "../types";
+import type { ChatMessage, ChatRoute, ChatTarget, FitCheck, InstalledModel, PullProgress, RunningModel } from "../types";
 import { fitClass, fitLabel } from "../types";
 import {
-  modelChat,
+  chatSend,
+  chatTargets,
   modelFitCheck,
   modelPull,
   modelRm,
@@ -20,17 +21,20 @@ interface State {
   error: string | null;
   installed: InstalledModel[] | null;
   loaded: RunningModel[] | null;
+  targets: ChatTarget[] | null;
+  targetsLoading: boolean;
   query: string;
   fitPreview: FitCheck | null;
   fitBusy: boolean;
   pulling: string | null;
   pullProgress: PullProgress | null;
   pullError: string | null;
-  chatModel: string | null;
+  chatTargetId: string | null;
   chatMessages: ChatMessage[];
   chatInput: string;
   chatBusy: boolean;
   chatStream: string;
+  chatStats: string | null;
 }
 
 const state: State = {
@@ -38,17 +42,20 @@ const state: State = {
   error: null,
   installed: null,
   loaded: null,
+  targets: null,
+  targetsLoading: false,
   query: "",
   fitPreview: null,
   fitBusy: false,
   pulling: null,
   pullProgress: null,
   pullError: null,
-  chatModel: null,
+  chatTargetId: null,
   chatMessages: [],
   chatInput: "",
   chatBusy: false,
   chatStream: "",
+  chatStats: null,
 };
 
 let unlistenPull: (() => void) | null = null;
@@ -58,6 +65,37 @@ let currentContainer: HTMLElement | null = null;
 
 function fmtGb(n: number | null): string {
   return n == null ? "—" : `${n.toFixed(1)}G`;
+}
+
+function selectedTarget(): ChatTarget | null {
+  if (!state.chatTargetId || !state.targets) return null;
+  return state.targets.find((t) => t.id === state.chatTargetId) ?? null;
+}
+
+function routeBadge(route: string): string {
+  switch (route) {
+    case "local":
+      return "fit-gpu";
+    case "mesh":
+      return "fit-partial";
+    case "endpoint":
+      return "fit-cpu";
+    default:
+      return "";
+  }
+}
+
+function routeLabel(route: string): string {
+  switch (route) {
+    case "local":
+      return "local";
+    case "mesh":
+      return "mesh";
+    case "endpoint":
+      return "hosted";
+    default:
+      return route;
+  }
 }
 
 function renderPullPanel(): string {
@@ -105,6 +143,85 @@ function renderProgress(): string {
   return escapeHtml(p.status);
 }
 
+function renderTargetPicker(): string {
+  const target = selectedTarget();
+  const groups = groupTargets(state.targets ?? []);
+  const options = groups
+    .map(
+      (g) => `
+        <optgroup label="${escapeHtml(g.label)}">
+          ${g.items
+            .map((t) => {
+              const detail = t.detail ? ` — ${t.detail}` : "";
+              return `<option value="${escapeHtml(t.id)}" ${t.id === state.chatTargetId ? "selected" : ""}>${escapeHtml(t.model)}${escapeHtml(detail)}</option>`;
+            })
+            .join("")}
+        </optgroup>
+      `,
+    )
+    .join("");
+
+  return `
+    <div class="panel-box">
+      <div class="panel-title">Chat</div>
+      ${
+        state.targetsLoading
+          ? `<div class="hint">loading models…</div>`
+          : !state.targets?.length
+            ? `<div class="status">No chat targets yet — pull a local model or join the mesh.</div>`
+            : `
+              <div class="row chat-target-row">
+                <select id="chat-target" class="chat-target-select">
+                  <option value="">Pick a model…</option>
+                  ${options}
+                </select>
+                ${target ? `<span class="badge ${routeBadge(target.route)}">${routeLabel(target.route)} · ${escapeHtml(target.label)}</span>` : ""}
+              </div>
+            `
+      }
+      ${target ? renderChatPanel(target) : `<div class="hint">Select a model to start chatting — local, mesh peer, or hosted endpoint.</div>`}
+    </div>
+  `;
+}
+
+function groupTargets(targets: ChatTarget[]): { label: string; items: ChatTarget[] }[] {
+  const order = ["local", "mesh", "endpoint"] as const;
+  const titles: Record<string, string> = {
+    local: "This machine",
+    mesh: "Mesh peers",
+    endpoint: "Hosted endpoints",
+  };
+  return order
+    .map((route) => ({
+      label: titles[route],
+      items: targets.filter((t) => t.route === route),
+    }))
+    .filter((g) => g.items.length > 0);
+}
+
+function renderChatPanel(target: ChatTarget): string {
+  const msgs = state.chatMessages
+    .map(
+      (m) => `<div class="chat-msg chat-${m.role}"><span class="chat-role">${m.role}</span>${escapeHtml(m.content)}</div>`,
+    )
+    .join("");
+  const streaming = state.chatStream
+    ? `<div class="chat-msg chat-assistant"><span class="chat-role">assistant</span>${escapeHtml(state.chatStream)}</div>`
+    : "";
+
+  return `
+    <div class="chat-panel">
+      <div class="chat-log">${msgs}${streaming}</div>
+      ${state.chatStats ? `<div class="hint chat-stats">${escapeHtml(state.chatStats)}</div>` : ""}
+      <div class="row">
+        <input type="text" id="chat-input" placeholder="Say something…" value="${escapeHtml(state.chatInput)}" ${state.chatBusy ? "disabled" : ""} />
+        <button id="chat-send" ${state.chatBusy ? "disabled" : ""}>${state.chatBusy ? "…" : "Send"}</button>
+        <button class="mini" id="chat-clear" ${state.chatBusy ? "disabled" : ""}>Clear</button>
+      </div>
+    </div>
+  `;
+}
+
 function renderInstalled(): string {
   if (state.loading) return `<div class="status">Loading installed models…</div>`;
   if (state.error) return `<div class="status error">${escapeHtml(state.error)}</div>`;
@@ -117,6 +234,7 @@ function renderInstalled(): string {
   const rows = state.installed
     .map((m) => {
       const isLoaded = loadedNames.has(m.name);
+      const localId = `local:${m.name}`;
       return `
         <tr>
           <td>
@@ -128,7 +246,7 @@ function renderInstalled(): string {
           <td class="tps">${m.tps_label ? escapeHtml(m.tps_label) : "—"}</td>
           <td>${isLoaded ? `<span class="badge fit-gpu">loaded</span>` : ""}</td>
           <td class="row-actions">
-            <button class="mini" data-chat="${escapeHtml(m.name)}">Chat</button>
+            <button class="mini" data-chat="${escapeHtml(localId)}">Chat</button>
             ${isLoaded ? `<button class="mini" data-stop="${escapeHtml(m.name)}">Unload</button>` : ""}
             <button class="mini danger" data-rm="${escapeHtml(m.name)}">Remove</button>
           </td>
@@ -149,38 +267,11 @@ function renderInstalled(): string {
   `;
 }
 
-function renderChat(): string {
-  if (!state.chatModel) {
-    return `<div class="status">Pick "Chat" on an installed model to start a conversation.</div>`;
-  }
-  const msgs = state.chatMessages
-    .map(
-      (m) => `<div class="chat-msg chat-${m.role}"><span class="chat-role">${m.role}</span>${escapeHtml(m.content)}</div>`,
-    )
-    .join("");
-  const streaming = state.chatStream
-    ? `<div class="chat-msg chat-assistant"><span class="chat-role">assistant</span>${escapeHtml(state.chatStream)}</div>`
-    : "";
-
-  return `
-    <div class="panel-box">
-      <div class="panel-title">Chat — ${escapeHtml(state.chatModel)}
-        <button class="mini" id="chat-close">Close</button>
-      </div>
-      <div class="chat-log">${msgs}${streaming}</div>
-      <div class="row">
-        <input type="text" id="chat-input" placeholder="Say something…" value="${escapeHtml(state.chatInput)}" ${state.chatBusy ? "disabled" : ""} />
-        <button id="chat-send" ${state.chatBusy ? "disabled" : ""}>${state.chatBusy ? "…" : "Send"}</button>
-      </div>
-    </div>
-  `;
-}
-
 function render(container: HTMLElement): void {
   container.innerHTML = `
     ${renderPullPanel()}
+    ${renderTargetPicker()}
     ${renderInstalled()}
-    ${renderChat()}
   `;
   bind(container);
 }
@@ -218,16 +309,27 @@ function bind(container: HTMLElement): void {
   });
   container.querySelectorAll<HTMLButtonElement>("[data-chat]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      state.chatModel = btn.dataset.chat!;
+      state.chatTargetId = btn.dataset.chat!;
       state.chatMessages = [];
       state.chatStream = "";
+      state.chatStats = null;
       render(container);
     });
   });
 
-  container.querySelector("#chat-close")?.addEventListener("click", () => {
-    state.chatModel = null;
+  container.querySelector<HTMLSelectElement>("#chat-target")?.addEventListener("change", (e) => {
+    const id = (e.target as HTMLSelectElement).value;
+    state.chatTargetId = id || null;
     state.chatMessages = [];
+    state.chatStream = "";
+    state.chatStats = null;
+    render(container);
+  });
+
+  container.querySelector("#chat-clear")?.addEventListener("click", () => {
+    state.chatMessages = [];
+    state.chatStream = "";
+    state.chatStats = null;
     render(container);
   });
 
@@ -239,6 +341,22 @@ function bind(container: HTMLElement): void {
     if (e.key === "Enter") void sendChat(container);
   });
   container.querySelector("#chat-send")?.addEventListener("click", () => void sendChat(container));
+}
+
+async function refreshTargets(container: HTMLElement): Promise<void> {
+  state.targetsLoading = true;
+  render(container);
+  try {
+    state.targets = await chatTargets(CTX);
+    if (state.chatTargetId && !state.targets.some((t) => t.id === state.chatTargetId)) {
+      state.chatTargetId = null;
+    }
+  } catch {
+    state.targets = [];
+  } finally {
+    state.targetsLoading = false;
+    render(container);
+  }
 }
 
 async function refresh(container: HTMLElement): Promise<void> {
@@ -255,6 +373,7 @@ async function refresh(container: HTMLElement): Promise<void> {
     state.loading = false;
     render(container);
   }
+  await refreshTargets(container);
 }
 
 async function doPull(container: HTMLElement): Promise<void> {
@@ -299,21 +418,39 @@ async function doStop(container: HTMLElement, model: string): Promise<void> {
   }
 }
 
+function targetToRoute(target: ChatTarget): ChatRoute {
+  return {
+    route: target.route,
+    model: target.model,
+    peer_addr: target.peer_addr,
+  };
+}
+
+function formatStats(reply: { tokens: number; tps: number; peer_id?: string; tokens_in?: number }): string {
+  const parts = [`${reply.tokens} tok out`];
+  if (reply.tokens_in != null) parts.unshift(`${reply.tokens_in} tok in`);
+  if (reply.tps > 0) parts.push(`${reply.tps.toFixed(1)} tok/s`);
+  if (reply.peer_id) parts.push(`via ${reply.peer_id}`);
+  return parts.join(" · ");
+}
+
 async function sendChat(container: HTMLElement): Promise<void> {
-  const model = state.chatModel;
+  const target = selectedTarget();
   const text = state.chatInput.trim();
-  if (!model || !text || state.chatBusy) return;
+  if (!target || !text || state.chatBusy) return;
 
   state.chatMessages.push({ role: "user", content: text });
   state.chatInput = "";
   state.chatBusy = true;
   state.chatStream = "";
+  state.chatStats = null;
   render(container);
 
   try {
-    const reply = await modelChat(model, state.chatMessages);
+    const reply = await chatSend(targetToRoute(target), state.chatMessages, CTX);
     state.chatMessages.push({ role: "assistant", content: reply.content });
     state.chatStream = "";
+    state.chatStats = formatStats(reply);
   } catch (err) {
     state.chatMessages.push({
       role: "assistant",

@@ -411,7 +411,107 @@ pub fn resume() -> Result<(), String> {
     Ok(())
 }
 
+// ── Chat targets (desktop + scheduling) ─────────────────────────────────────
+
+/// One routable chat destination: local Ollama, a mesh peer, or a hosted endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatTarget {
+    /// Stable id for UI selection (`local:tag`, `mesh:addr:tag`, `endpoint:name`).
+    pub id: String,
+    pub model: String,
+    /// `local`, `mesh`, or `endpoint`.
+    pub route: String,
+    /// Human route label, e.g. "this machine" or a peer hostname.
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Set for mesh routes — dial this peer; `None` means auto-rank best peer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_addr: Option<String>,
+}
+
+/// Enumerate every model the UI can chat with on this machine and across the mesh.
+pub fn chat_targets(host: &str, hw: &HardwareInfo, ctx: u32) -> Result<Vec<ChatTarget>, String> {
+    let mut out = vec![];
+    let local_label = super::gossip::local_hostname();
+
+    for m in crate::manage::installed_with_fit(host, hw, ctx)? {
+        out.push(ChatTarget {
+            id: format!("local:{}", m.name),
+            model: m.name.clone(),
+            route: "local".into(),
+            label: local_label.clone(),
+            detail: Some(m.display_name),
+            peer_addr: None,
+        });
+    }
+
+    for ep in crate::endpoints::load() {
+        let host_hint = crate::endpoints::host_of(&ep.url);
+        let detail = format!("{} · {}", ep.name, host_hint);
+        for alias in crate::endpoints::aliases(&ep) {
+            out.push(ChatTarget {
+                id: format!("endpoint:{}:{alias}", ep.name),
+                model: alias,
+                route: "endpoint".into(),
+                label: "hosted endpoint".into(),
+                detail: Some(detail.clone()),
+                peer_addr: None,
+            });
+        }
+    }
+
+    if let Ok(peers) = peers_data() {
+        for PeerCard { addr, card } in peers {
+            let peer_label = if card.hostname.is_empty() {
+                short_id(&card.node_pub)
+            } else {
+                card.hostname.clone()
+            };
+            for model in &card.models {
+                out.push(ChatTarget {
+                    id: format!("mesh:{addr}:{model}"),
+                    model: model.clone(),
+                    route: "mesh".into(),
+                    label: peer_label.clone(),
+                    detail: Some(format!("{model} · {addr}")),
+                    peer_addr: Some(addr.clone()),
+                });
+            }
+            for rm in &card.remote_models {
+                let model = if rm.name.is_empty() { rm.model.clone() } else { rm.name.clone() };
+                out.push(ChatTarget {
+                    id: format!("mesh:{addr}:remote:{model}"),
+                    model: model.clone(),
+                    route: "mesh".into(),
+                    label: peer_label.clone(),
+                    detail: Some(format!("{model} · {} · {}", rm.host, addr)),
+                    peer_addr: Some(addr.clone()),
+                });
+            }
+        }
+    }
+
+    out.sort_by(|a, b| {
+        a.route
+            .cmp(&b.route)
+            .then_with(|| a.label.cmp(&b.label))
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    Ok(out)
+}
+
 // ── Remote inference ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteChatResult {
+    pub content: String,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub tps: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_id: Option<String>,
+}
 
 /// Score a peer for a request: higher is better; `None` if it can't serve.
 fn score(card: &NodeCard, model: &str) -> Option<f64> {
@@ -423,6 +523,32 @@ fn score(card: &NodeCard, model: &str) -> Option<f64> {
 
 /// Run `model` on the best available org peer, streaming the reply to stdout.
 pub fn remote_run(_hw: &HardwareInfo, model: &str, ctx: u32, prompt: &str) -> Result<(), String> {
+    let messages = serde_json::json!([{ "role": "user", "content": prompt }]);
+    println!("{} {}", "»".cyan(), model.bold());
+    let result = remote_chat(model, ctx, &messages, None, |tok| {
+        print!("{tok}");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        true
+    })?;
+    println!();
+    let via = result.peer_id.as_deref().unwrap_or("peer");
+    println!(
+        "{}",
+        format!("  {} tok · {:.0} tok/s · {}", result.tokens_out, result.tps, via).dimmed()
+    );
+    Ok(())
+}
+
+/// Stream a multi-turn chat against a mesh peer. When `preferred_peer` is set,
+/// only that address is tried; otherwise peers are ranked by fit and bandwidth.
+pub fn remote_chat(
+    model: &str,
+    ctx: u32,
+    messages: &serde_json::Value,
+    preferred_peer: Option<&str>,
+    mut on_token: impl FnMut(&str) -> bool,
+) -> Result<RemoteChatResult, String> {
     let node = NodeKey::load_or_create()?;
     let ident = MeshIdentity::load()?.ok_or("not a mesh member; run `v2 mesh join <ticket>`")?;
     let org_pub = ident.org_pub_bytes()?;
@@ -432,7 +558,26 @@ pub fn remote_run(_hw: &HardwareInfo, model: &str, ctx: u32, prompt: &str) -> Re
         return Err("no known peers; add one with `v2 mesh peer add host:port`".into());
     }
 
-    // Rank peers by card, best first; peers we can't card-check go last.
+    let order = peer_order(model, preferred_peer, &peers)?;
+
+    for addr in order {
+        match try_peer_chat(&addr, &node, &ident, &org_pub, &revs, model, ctx, messages, &mut on_token) {
+            Ok(TryPeerOutcome::Served(result)) => return Ok(result),
+            Ok(TryPeerOutcome::Declined) => continue,
+            Err(e) => eprintln!("  {addr}: {e}"),
+        }
+    }
+    Err(format!("no peer could serve {model} right now"))
+}
+
+fn peer_order(model: &str, preferred_peer: Option<&str>, peers: &PeersFile) -> Result<Vec<String>, String> {
+    if let Some(addr) = preferred_peer {
+        if !peers.peers.iter().any(|p| p.addr == addr) {
+            return Err(format!("peer {addr} is not in your known-peer list"));
+        }
+        return Ok(vec![addr.to_string()]);
+    }
+
     let cards = collect_cards().unwrap_or_default();
     let mut ranked: Vec<(String, f64)> = cards
         .iter()
@@ -445,21 +590,16 @@ pub fn remote_run(_hw: &HardwareInfo, model: &str, ctx: u32, prompt: &str) -> Re
             order.push(p.addr.clone());
         }
     }
+    Ok(order)
+}
 
-    let messages = serde_json::json!([{ "role": "user", "content": prompt }]);
-
-    for addr in order {
-        match try_peer(&addr, &node, &ident, &org_pub, &revs, model, ctx, &messages) {
-            Ok(true) => return Ok(()),         // served
-            Ok(false) => continue,              // refused/queued: try next
-            Err(e) => eprintln!("  {addr}: {e}"),
-        }
-    }
-    Err(format!("no peer could serve {model} right now"))
+enum TryPeerOutcome {
+    Served(RemoteChatResult),
+    Declined,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn try_peer(
+fn try_peer_chat(
     addr: &str,
     node: &NodeKey,
     ident: &MeshIdentity,
@@ -468,7 +608,8 @@ fn try_peer(
     model: &str,
     ctx: u32,
     messages: &serde_json::Value,
-) -> Result<bool, String> {
+    on_token: &mut impl FnMut(&str) -> bool,
+) -> Result<TryPeerOutcome, String> {
     let (mut ch, peer) = transport::connect_member(addr, node, ident.cert.clone(), org_pub, revs)?;
     let server_pub = match &peer {
         Peer::Member { node_pub, .. } => node_pub.clone(),
@@ -479,38 +620,54 @@ fn try_peer(
     }
     remember_peer_node(addr, &server_pub);
 
-    ch.send_json(&Request::Chat { model: model.to_string(), ctx, messages: messages.clone() })
-        .map_err(|e| e.to_string())?;
+    ch.send_json(&Request::Chat {
+        model: model.to_string(),
+        ctx,
+        messages: messages.clone(),
+    })
+    .map_err(|e| e.to_string())?;
 
-    println!("{} {} via {}", "»".cyan(), model.bold(), short_id(&server_pub).dimmed());
+    let mut content = String::new();
     loop {
         let frame: Frame = ch.recv_json().map_err(|e| e.to_string())?;
         match frame {
             Frame::Accepted => {}
             Frame::Token { c } => {
-                print!("{c}");
-                use std::io::Write;
-                std::io::stdout().flush().ok();
+                content.push_str(&c);
+                if !on_token(&c) {
+                    return Err("chat cancelled".into());
+                }
             }
             Frame::Queued { reason } | Frame::Refused { reason } => {
-                println!("{}", format!("  {addr} declined: {reason}").dimmed());
-                return Ok(false);
+                eprintln!("{}", format!("  {addr} declined: {reason}").dimmed());
+                return Ok(TryPeerOutcome::Declined);
             }
-            Frame::Error { reason } => {
-                println!();
-                return Err(reason);
-            }
-            Frame::Done { tokens_in, tokens_out, duration_ms, receipt } => {
-                println!();
-                let tps = if duration_ms > 0 { tokens_out as f64 / (duration_ms as f64 / 1000.0) } else { 0.0 };
-                println!("{}", format!("  {tokens_out} tok · {tps:.0} tok/s · {}", short_id(&server_pub)).dimmed());
+            Frame::Error { reason } => return Err(reason),
+            Frame::Done {
+                tokens_in,
+                tokens_out,
+                duration_ms,
+                receipt,
+            } => {
+                let tps = if duration_ms > 0 {
+                    tokens_out as f64 / (duration_ms as f64 / 1000.0)
+                } else {
+                    0.0
+                };
                 cosign_and_store(node, &mut ch, receipt, &server_pub, model, tokens_in, tokens_out)?;
-                return Ok(true);
+                return Ok(TryPeerOutcome::Served(RemoteChatResult {
+                    content,
+                    tokens_in,
+                    tokens_out,
+                    tps,
+                    peer_id: Some(short_id(&server_pub)),
+                }));
             }
             _ => {}
         }
     }
 }
+
 
 fn cosign_and_store(
     node: &NodeKey,

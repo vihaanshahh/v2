@@ -125,6 +125,23 @@ export interface ChatReply {
   content: string;
   tokens: number;
   tps: number;
+  peer_id?: string;
+  tokens_in?: number;
+}
+
+export interface ChatTarget {
+  id: string;
+  model: string;
+  route: "local" | "mesh" | "endpoint";
+  label: string;
+  detail?: string;
+  peer_addr?: string;
+}
+
+export interface ChatRoute {
+  route: "local" | "mesh" | "endpoint";
+  model: string;
+  peer_addr?: string;
 }
 
 // ── Serve / usage / doctor ───────────────────────────────────────────────────

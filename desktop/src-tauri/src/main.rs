@@ -16,6 +16,8 @@ fn main() {
             commands::models::model_rm,
             commands::models::model_stop,
             commands::models::model_chat,
+            commands::models::chat_targets,
+            commands::models::chat_send,
             commands::serve::serve_start,
             commands::serve::serve_stop,
             commands::serve::serve_status,

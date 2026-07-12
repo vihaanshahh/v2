@@ -284,6 +284,25 @@ header {
   border: 1px solid var(--border);
 }
 
+.chat-target-row {
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.chat-target-select {
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-panel {
+  margin-top: 8px;
+}
+
+.chat-stats {
+  margin-bottom: 8px;
+}
+
 .doctor-line {
   display: flex;
   gap: 10px;

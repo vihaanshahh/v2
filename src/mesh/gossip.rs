@@ -91,6 +91,10 @@ pub fn local_card(node_pub: &str, hw: &HardwareInfo, installed: &[String], concu
     }
 }
 
+pub fn local_hostname() -> String {
+    hostname()
+}
+
 fn hostname() -> String {
     // Real system hostname, cross-platform.
     if let Ok(out) = std::process::Command::new("hostname").output() {
